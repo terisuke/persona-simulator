@@ -15,11 +15,24 @@ Xアカウントの投稿を分析し、ペルソナを動的に生成して仮�
 
 ## 特徴
 
-- **実投稿取得**: X API v2で実際のX投稿を取得（オプション）
-- **サンプル生成**: X API未設定時はGrok LLMでサンプル投稿を生成
+- **チャット風UI + ターン制議論** 💬（NEW!）
+  - 🎨 吹き出し形式で視覚的に分かりやすい
+  - 🔄 ターン制で本物の議論を再現
+  - 👥 最大10アカウントで議論可能
+  - 💬 選択的反論 or 全員反論
+  - 📊 ラウンド別表示で議論の流れを把握
+- **3層キャッシュシステム**: all_data + セッション状態 + ファイルキャッシュでレート制限を完全回避
+  - 💾 **ボタンクリック時も再取得なし**（議論開始ボタン等）
+  - 💾 設定変更時も**再取得不要**（自動再実行でもAPI呼び出しなし）
+  - 🔄 手動再取得ボタンで最新データを取得可能
+  - 🆕 新規アカウント追加時のみ自動取得
+- **スマート投稿取得**: 4段階のフォールバック戦略で確実に投稿を取得
+  1. 🔑 X API v2 (ユーザーIDベース)
+  2. 🔍 X API v2 (検索API: `from:username`)
+  3. 🌐 **Grok Realtime Web Search**（実投稿を検索）
+  4. ⚠️ フォールバック: サンプル投稿生成
+- **他アカウント対応**: 認証なしで任意のアカウントを分析可能（Web Search活用）
 - **ペルソナ生成**: 投稿から口調・性格を徹底的に模倣（Grok LLM）
-- **議論シミュレーション**: 指定トピックに対する意見を生成（過去投稿を引用）
-- **10アカウント対応**: 最大10アカウントまで同時分析可能
 - **データ駆動**: sentence-transformersで類似投稿を自動抽出
 
 ## セットアップ
@@ -49,13 +62,15 @@ X_BEARER_TOKEN = "your_x_bearer_token_here"
 ```
 
 **Grok APIキー（必須）**:
+
 - [https://x.ai/api](https://x.ai/api) から取得
 - ペルソナ生成・議論生成に使用
 
 **X API Bearer Token（オプション）**:
+
 - [https://developer.x.com/](https://developer.x.com/) から取得
-- 実際のX投稿を取得する場合に設定
-- 未設定の場合、Grok LLMがサンプル投稿を生成
+- 実際のX投稿を高速に取得する場合に設定（推奨）
+- 未設定の場合、Grok Realtime Web Searchで実投稿を検索
 - 詳細は `X_API_SETUP.md` を参照
 
 **注意**: このファイルは `.gitignore` に含まれており、Gitにコミットされません。
@@ -68,20 +83,25 @@ streamlit run app.py
 
 ## 使い方
 
-### 基本モード
+### チャット風議論モード 💬（NEW!）
 
-1. Xアカウント名を入力（例: @cor_terisuke）
-2. 議論トピックを入力（例: "AIの倫理的課題"）
-3. 「議論を生成」ボタンをクリック
-4. ペルソナの意見と引用された過去投稿を確認
+1. サイドバーでXアカウントを入力（例: cor_terisuke, elonmusk）
+2. 議論トピックを入力（例: "AIの倫理的課題について"）
+3. 「🚀 議論を開始」ボタンをクリック
+4. **チャット風タイムライン**で全員の初回意見を確認
+
+**ターン制議論**:
+
+- 「💬 選択した反論を生成」→ 特定の人が特定の人に反論
+- 「🔄 全員の反論を生成」→ 全員が順番に反論
+- ラウンドを重ねて議論を深める
 
 ### AIエージェントモード 🤖
 
 1. サイドバーで**「マルチプラットフォーム分析」**をON（デフォルト） → Instagram、LinkedIn、GitHub等も検索
 2. サイドバーで**「会話履歴を保持」**をON → 継続的な対話
 3. サイドバーで**「Web検索を有効化」**をON → 最新情報を取得
-4. トピックを入力して議論生成
-5. 追加質問で前回の議論を参照した対話が可能
+4. 議論を生成すると、文脈を考慮した自然な反論が可能
 
 ## デプロイ (Streamlit Cloud)
 
@@ -93,7 +113,7 @@ streamlit run app.py
 ## 技術スタック
 
 - **フロントエンド**: Streamlit
-- **API**: 
+- **API**:
   - Grok API (LLM - ペルソナ生成・議論生成)
   - X API v2 (投稿取得 - オプション)
 - **機械学習**: sentence-transformers (類似検索)
@@ -101,14 +121,15 @@ streamlit run app.py
 
 ## プロジェクト構造
 
-```
+```text
 persona-simulator/
 ├── app.py                 # メインStreamlitアプリ
 ├── utils/
-│   ├── grok_api.py       # Grok API連携（LLM）
+│   ├── grok_api.py       # Grok API連携（LLM + 反論生成）
 │   ├── x_api.py          # X API v2連携（投稿取得）
 │   ├── persona.py        # ペルソナ生成
 │   ├── similarity.py     # 類似検索
+│   ├── debate_ui.py      # チャット風UI + ターン制議論（NEW!）
 │   └── error_handler.py  # エラーハンドリング
 ├── requirements.txt       # 依存関係
 ├── .streamlit/
@@ -119,15 +140,13 @@ persona-simulator/
 └── test_setup.py         # セットアップテスト
 ```
 
-## 📚 詳細ドキュメント
+## 📚 ドキュメント
 
-- `MULTI_PLATFORM_PERSONA.md` - **マルチプラットフォーム・ペルソナ生成（NEW!）**
-- `AI_AGENT_FEATURES.md` - AIエージェント機能の詳細説明
-- `GROK_MODEL_UPDATE.md` - Grokモデル更新ガイド
-- `X_API_SETUP.md` - X API設定ガイド
-- `QUICKSTART.md` - クイックスタート
+- 📖 **`FEATURES.md`** - 全機能の詳細説明（チャット風UI、キャッシュ、アカウント管理等）
+- 🚀 **`QUICKSTART.md`** - クイックスタートガイド
+- 🔑 **`X_API_SETUP.md`** - X API設定ガイド
+- 📝 **`RELEASE_NOTES_v2.md`** - v2.0リリースノート
 
 ## ライセンス
 
 [MIT License](./LICENCE)
-
