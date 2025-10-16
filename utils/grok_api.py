@@ -16,6 +16,9 @@ from .error_handler import (
 
 logger = logging.getLogger(__name__)
 
+# 定数定義
+MAX_CITATION_POSTS = 3  # 引用する投稿の最大数
+
 
 class GrokAPI:
     """Grok APIとの連携を管理するクラス"""
@@ -54,8 +57,11 @@ class GrokAPI:
         """
         指定されたXアカウントの投稿を取得
         
-        X API v2が利用可能な場合は実際の投稿を取得、
-        それ以外はGrok LLMでサンプル投稿を生成
+        取得優先順位:
+        1. X API v2 (fetch_user_tweets)
+        2. X API v2 (search_recent_tweets with from:username)
+        3. Grok Realtime Web Search
+        4. フォールバック: サンプル投稿生成
         
         Args:
             account: Xアカウント名（@付きでも可）
@@ -71,15 +77,38 @@ class GrokAPI:
         
         # X API v2が利用可能な場合は実投稿を取得
         if x_api_client:
+            # 方法1: ユーザーIDベースの取得を試行
             try:
-                logger.info(f"X APIで実際の投稿を取得中: @{account}")
-                return x_api_client.fetch_user_tweets(account, max_results=limit)
+                logger.info(f"[方法1] X APIでユーザーツイートを取得中: @{account}")
+                posts = x_api_client.fetch_user_tweets(account, max_results=limit)
+                if posts:
+                    logger.info(f"✅ X API (fetch_user_tweets) 成功: {len(posts)}件")
+                    return posts
             except Exception as e:
-                logger.warning(f"X API取得失敗: {str(e)}")
-                logger.info("フォールバック: Grok LLMで投稿を生成します")
+                logger.warning(f"[方法1] 失敗: {str(e)}")
+            
+            # 方法2: 検索APIを使用（from:username クエリ）
+            try:
+                logger.info(f"[方法2] X API検索を試行中: from:{account}")
+                search_query = f"from:{account} -is:retweet -is:reply"
+                posts = x_api_client.search_recent_tweets(search_query, max_results=limit)
+                if posts:
+                    logger.info(f"✅ X API (search_recent_tweets) 成功: {len(posts)}件")
+                    return posts
+            except Exception as e:
+                logger.warning(f"[方法2] 失敗: {str(e)}")
+            
+            logger.info("X API両方失敗、次の方法へフォールバック")
         
-        # フォールバック: Grok LLMで生成
-        logger.info(f"Grok LLMで投稿を生成中: @{account} (limit={limit})")
+        # 方法3: Grok Realtime Web Searchで実投稿を取得
+        logger.info(f"[方法3] Grok Web Searchで実投稿を検索中: @{account}")
+        web_posts = self._fetch_posts_via_web_search(account, limit)
+        if web_posts:
+            logger.info(f"✅ Grok Web Search 成功: {len(web_posts)}件")
+            return web_posts
+        
+        # 方法4: フォールバック - LLMでサンプル投稿生成
+        logger.info(f"[方法4] フォールバック: サンプル投稿を生成中: @{account} (limit={limit})")
         
         try:
             with PerformanceLogger(f"投稿生成: @{account}"):
@@ -438,7 +467,7 @@ JSON形式で出力してください：
         # 関連投稿を引用形式で整形
         citations = "\n".join([
             f"[{i+1}] {post['text']} (リンク: {post['link']})"
-            for i, post in enumerate(relevant_posts[:3])
+            for i, post in enumerate(relevant_posts[:MAX_CITATION_POSTS])
         ])
         
         web_search_note = ""
@@ -484,9 +513,167 @@ JSON形式で出力してください：
         
         return None
     
+    def generate_rebuttal(
+        self,
+        topic: str,
+        persona: Dict,
+        target_account: str,
+        target_opinion: str,
+        previous_context: str = "",
+        use_history: bool = True,
+        enable_live_search: bool = False
+    ) -> Optional[str]:
+        """
+        他者の意見に対する反論を生成
+        
+        Args:
+            topic: 議論トピック
+            persona: 反論する側のペルソナ
+            target_account: 反論対象のアカウント
+            target_opinion: 反論対象の意見
+            previous_context: これまでの議論の文脈
+            use_history: 会話履歴を使用
+            enable_live_search: Web検索を有効化
+            
+        Returns:
+            生成された反論
+        """
+        context_section = ""
+        if previous_context:
+            context_section = f"""
+【これまでの議論】
+{previous_context}
+"""
+        
+        web_search_note = ""
+        if enable_live_search:
+            web_search_note = "\n\n【重要】必要に応じて最新のWeb情報を検索して、反論の根拠にしてください。"
+        
+        prompt = f"""あなたは以下のペルソナとして振る舞ってください：
+
+【あなたのペルソナ】
+- 名前: {persona.get('name', 'Unknown')}
+- 背景: {persona.get('background', '')}
+- 意見傾向: {', '.join(persona.get('tendencies', []))}
+- 口調: {persona.get('tone', '')}
+- 性格: {persona.get('personality', '')}
+
+【議論トピック】
+{topic}
+{context_section}
+【@{target_account}の意見】
+{target_opinion}
+
+@{target_account}の意見に対して、あなたのペルソナの立場から反論・応答してください。
+
+【反論のガイドライン】
+- ペルソナの口調と性格を**徹底的に模倣**
+- 建設的な反論（相手の意見を一部認めつつ、自分の視点を示す）
+- 攻撃的にならず、議論を深める
+- 具体例や経験があれば言及
+- 100-200文字程度{web_search_note}
+
+反論:
+"""
+        
+        result = self.generate_completion(
+            prompt,
+            temperature=0.85,  # やや高めで多様性を
+            max_tokens=400,
+            use_history=use_history,
+            enable_live_search=enable_live_search
+        )
+        
+        if result:
+            logger.info(f"反論生成完了: @{target_account}への反論")
+            return result.strip()
+        
+        return None
+    
+    def _fetch_posts_via_web_search(self, account: str, limit: int) -> List[Dict]:
+        """
+        Grok Realtime Web Searchで実際の投稿を検索・取得
+        
+        Args:
+            account: アカウント名
+            limit: 取得する投稿数
+            
+        Returns:
+            実投稿リスト（見つかった場合）、空リスト（失敗時）
+        """
+        logger.info(f"Grok Web Searchで@{account}の実投稿を検索中...")
+        
+        prompt = f"""X (Twitter) で「@{account}」というアカウントの最近の投稿を{limit}件検索してください。
+
+【重要な指示】
+- 実際に存在する投稿のみを返してください（架空の投稿は不可）
+- 投稿の本文テキストと投稿日時を正確に取得してください
+- リツイートや返信は除外してください
+
+以下のJSON配列形式で出力してください：
+[
+  {{"text": "実際の投稿内容1", "date": "YYYY-MM-DD"}},
+  {{"text": "実際の投稿内容2", "date": "YYYY-MM-DD"}},
+  ...
+]
+
+投稿が見つからない場合は空配列 [] を返してください。
+JSON配列のみを出力し、他の説明は不要です。"""
+
+        try:
+            result = self.generate_completion(
+                prompt,
+                temperature=0.3,  # 正確性重視
+                max_tokens=2500,
+                enable_live_search=True  # Web検索を強制有効化
+            )
+            
+            if result:
+                import json
+                # JSONパース
+                result_clean = result.strip()
+                if result_clean.startswith("```"):
+                    result_clean = result_clean.split("```")[1]
+                    if result_clean.startswith("json"):
+                        result_clean = result_clean[4:]
+                    result_clean = result_clean.strip()
+                
+                try:
+                    found_posts = json.loads(result_clean)
+                    
+                    if not found_posts or len(found_posts) == 0:
+                        logger.info("Web検索: 投稿が見つかりませんでした")
+                        return []
+                    
+                    # 投稿リストに変換
+                    posts = []
+                    for i, post_data in enumerate(found_posts[:limit]):
+                        text = post_data.get("text", "")
+                        if text:  # 空でない投稿のみ
+                            posts.append({
+                                "id": f"web_search_{account}_{i}",
+                                "text": text,
+                                "link": f"https://x.com/{account}/status/web_search_{i}",
+                                "date": post_data.get("date", "2024-10-15")
+                            })
+                    
+                    logger.info(f"Web検索完了: {len(posts)}件の実投稿を取得")
+                    return posts
+                
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Web検索結果のJSON パース失敗: {e}")
+                    return []
+            else:
+                logger.warning("Web検索: レスポンスなし")
+                return []
+        
+        except Exception as e:
+            logger.error(f"Web検索エラー: {str(e)}")
+            return []
+    
     def _get_sample_posts(self, account: str, limit: int) -> List[Dict]:
         """
-        サンプル投稿を返す（LLM生成失敗時のフォールバック）
+        サンプル投稿を返す（全ての方法が失敗した時の最終フォールバック）
         
         Args:
             account: アカウント名
