@@ -500,6 +500,9 @@ def main():
                 debate_ui.clear_debate()
                 if grok_api:
                     grok_api.clear_conversation_history()
+                # アバター割り当てもクリア（完全リセット）
+                if 'account_avatars' in st.session_state:
+                    st.session_state['account_avatars'] = {}
                 st.success("議論をリセットしました")
                 st.rerun()
         

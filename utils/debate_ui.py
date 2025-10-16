@@ -7,7 +7,6 @@ import streamlit as st
 from datetime import datetime
 from typing import List, Dict, Optional
 import logging
-import html
 
 logger = logging.getLogger(__name__)
 
@@ -109,84 +108,50 @@ class DebateUI:
         logger.info("議論をクリアしました")
     
     def render_message(self, message: DebateMessage, align_right: bool = False):
-        """チャット風にメッセージを表示"""
+        """チャット風にメッセージを表示（Streamlit標準コンポーネント使用）"""
         avatar = self.assign_avatar(message.account)
-        bg_color = self.MESSAGE_COLORS.get(message.message_type, "#f5f5f5")
-        
-        # メッセージ内容をHTMLエスケープ
-        escaped_content = html.escape(message.content)
-        escaped_account = html.escape(message.account)
-        
-        # 返信先の表示
-        reply_html = ""
-        if message.reply_to:
-            escaped_reply_to = html.escape(message.reply_to)
-            reply_html = f"""
-            <div style="font-size: 0.8em; color: #666; margin-bottom: 5px;">
-                💬 @{escaped_reply_to} への返信
-            </div>
-            """
         
         # メッセージタイプのバッジ
-        badge_html = ""
+        badge = ""
         if message.message_type == "reply":
-            badge_html = '<span style="background: #9c27b0; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.7em; margin-left: 5px;">返信</span>'
+            badge = "💬 返信"
         elif message.message_type == "rebuttal":
-            badge_html = '<span style="background: #ff9800; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.7em; margin-left: 5px;">反論</span>'
+            badge = "🔥 反論"
         
-        if align_right:
-            # 右寄せ（自分のメッセージ風）
-            html_content = f"""
-            <div style="display: flex; justify-content: flex-end; margin: 15px 0;">
-                <div style="max-width: 70%; background: {bg_color}; padding: 12px 16px; border-radius: 18px 18px 5px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
-                    {reply_html}
-                    <div style="font-weight: bold; color: #1976d2; margin-bottom: 5px;">
-                        {avatar} @{escaped_account} {badge_html}
-                    </div>
-                    <div style="color: #424242; line-height: 1.5;">
-                        {escaped_content}
-                    </div>
-                    <div style="text-align: right; font-size: 0.75em; color: #757575; margin-top: 5px;">
-                        {message.timestamp}
-                    </div>
-                </div>
-            </div>
-            """
+        # 返信先の表示
+        if message.reply_to:
+            st.caption(f"💬 @{message.reply_to} への返信")
+        
+        # メッセージヘッダー
+        header = f"{avatar} **@{message.account}**"
+        if badge:
+            header += f" `{badge}`"
+        header += f" - {message.timestamp}"
+        
+        # メッセージを表示（Streamlitの標準コンポーネント）
+        if message.message_type == "initial":
+            with st.container():
+                st.markdown(header)
+                st.info(message.content)
+        elif message.message_type == "reply":
+            with st.container():
+                st.markdown(header)
+                st.success(message.content)
+        elif message.message_type == "rebuttal":
+            with st.container():
+                st.markdown(header)
+                st.warning(message.content)
         else:
-            # 左寄せ（相手のメッセージ風）
-            html_content = f"""
-            <div style="display: flex; justify-content: flex-start; margin: 15px 0;">
-                <div style="max-width: 70%; background: {bg_color}; padding: 12px 16px; border-radius: 18px 18px 18px 5px; box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
-                    {reply_html}
-                    <div style="font-weight: bold; color: #1976d2; margin-bottom: 5px;">
-                        {avatar} @{escaped_account} {badge_html}
-                    </div>
-                    <div style="color: #424242; line-height: 1.5;">
-                        {escaped_content}
-                    </div>
-                    <div style="text-align: left; font-size: 0.75em; color: #757575; margin-top: 5px;">
-                        {message.timestamp}
-                    </div>
-                </div>
-            </div>
-            """
-        
-        st.markdown(html_content, unsafe_allow_html=True)
+            with st.container():
+                st.markdown(header)
+                st.info(message.content)
     
     def render_round_header(self, round_num: int):
         """ラウンドヘッダーを表示"""
         if round_num == 0:
-            title = "📢 初回意見"
+            st.subheader("📢 初回意見")
         else:
-            title = f"🔄 ラウンド {round_num} - 反論・応答"
-        
-        st.markdown(f"""
-        <div style="text-align: center; margin: 30px 0 20px 0; padding: 15px; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-            <h3 style="color: white; margin: 0; font-size: 1.3em;">
-                {title}
-            </h3>
-        </div>
-        """, unsafe_allow_html=True)
+            st.subheader(f"🔄 ラウンド {round_num} - 反論・応答")
     
     def render_debate_timeline(self):
         """議論全体をタイムライン形式で表示"""
@@ -225,12 +190,9 @@ class DebateUI:
         for i, account in enumerate(accounts):
             with cols[i]:
                 avatar = self.assign_avatar(account)
-                st.markdown(f"""
-                <div style="text-align: center; padding: 10px; background: #f5f5f5; border-radius: 10px; margin: 5px;">
-                    <div style="font-size: 2em;">{avatar}</div>
-                    <div style="font-weight: bold; margin-top: 5px;">@{account}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                # Streamlit標準コンポーネントを使用
+                st.markdown(f"<div style='text-align: center; font-size: 2.5em;'>{avatar}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: center; font-weight: bold;'>@{account}</div>", unsafe_allow_html=True)
     
     def get_current_round(self) -> int:
         """現在のラウンド番号を取得"""
