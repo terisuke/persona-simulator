@@ -15,10 +15,17 @@ Xアカウントの投稿を分析し、ペルソナを動的に生成して仮�
 
 ## 特徴
 
-- **チャット風UI + ターン制議論** 💬（NEW!）
+- **一括管理機能** 📁（NEW!）
+  - 📥 CSV/テキストファイルから100アカウントまで一括アップロード
+  - 🔄 バッチ処理で段階的にデータ取得（10件ずつ）
+  - 📊 進捗サマリとリアルタイム状況表示
+  - 🔍 フィルタリング・検索・ソート機能
+  - 📋 アカウント管理タブで一括操作
+  - 💾 キャッシュ自動検出と復元
+- **チャット風UI + ターン制議論** 💬
   - 🎨 吹き出し形式で視覚的に分かりやすい
   - 🔄 ターン制で本物の議論を再現
-  - 👥 最大10アカウントで議論可能
+  - 👥 最大100アカウントで議論可能（一括管理対応）
   - 💬 選択的反論 or 全員反論
   - 📊 ラウンド別表示で議論の流れを把握
 - **3層キャッシュシステム**: all_data + セッション状態 + ファイルキャッシュでレート制限を完全回避
@@ -34,6 +41,25 @@ Xアカウントの投稿を分析し、ペルソナを動的に生成して仮�
 - **他アカウント対応**: 認証なしで任意のアカウントを分析可能（Web Search活用）
 - **ペルソナ生成**: 投稿から口調・性格を徹底的に模倣（Grok LLM）
 - **データ駆動**: sentence-transformersで類似投稿を自動抽出
+
+## クイックスタート（5分）
+
+1. **依存関係をインストール**
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **APIキーを設定**  
+   `.streamlit/secrets.toml` を作成し、最低でも `GROK_API_KEY` を登録します。（任意で `X_BEARER_TOKEN` を加えるとX API経由の高速取得が可能）
+3. **環境チェック**
+   ```bash
+   python test_setup.py
+   ```
+4. **アプリを起動**
+   ```bash
+   streamlit run app.py
+   ```
+
+大規模（50-100件）のアカウントを扱う場合は、UI を開く前に CLI (`python ingest_accounts.py accounts.csv`) でキャッシュを作成しておくと即座に分析を始められます。
 
 ## セットアップ
 
@@ -83,7 +109,54 @@ streamlit run app.py
 
 ## 使い方
 
-### チャット風議論モード 💬（NEW!）
+### 一括管理モード 📁（NEW!）
+
+**大規模アカウント管理**:
+
+1. **CSV/テキストファイルで一括アップロード**
+   - CSV: `username`列を含むファイル
+   - TXT: 改行区切りでアカウント名を記載
+   - 最大100アカウントまで対応
+
+2. **バッチ処理で段階的取得**
+   - 「🚀 不足分を取得」ボタンで10件ずつ処理
+   - 進捗バーでリアルタイム状況確認
+   - レート制限を考慮した安全な処理
+
+3. **アカウント管理タブで一括操作**
+   - フィルタリング・検索・ソート機能
+   - 一括再取得・エクスポート・削除
+   - ステータス別表示（キャッシュ済み/取得待ち/エラー）
+
+### CLI を使った事前キャッシュ生成 🖥️（推奨: 50人以上）
+
+UI からのバッチ処理に加えて、**CLI で事前にキャッシュを生成**することで、より効率的な大規模分析が可能です:
+
+```bash
+# アカウントリスト (CSV または TXT) から一括取得
+python ingest_accounts.py accounts.csv
+
+# バッチサイズを調整してレート制限を管理
+python ingest_accounts.py accounts.csv --batch-size 10
+
+# Web検索を無効化して高速化
+python ingest_accounts.py accounts.csv --no-web-enrichment
+```
+
+**CLI のメリット**:
+- ✅ レート制限を自動監視・管理 (15分/15リクエスト)
+- ✅ バックグラウンドで長時間実行可能
+- ✅ 詳細ログファイル (`.cache/ingest.log`)
+- ✅ 中断・再開が可能 (キャッシュ済みはスキップ)
+- ✅ 100人分のデータを30-60分で取得
+
+**ファイル形式**:
+- **CSV**: `account`, `username`, `name`, `handle` 列のいずれかを含む
+- **TXT**: 1行1アカウント（`#` で始まる行はコメント）
+
+**詳細な使い方**は `AGENTS.md` の「CLI for Batch Account Ingestion」セクションを参照してください。
+
+### チャット風議論モード 💬
 
 1. サイドバーでXアカウントを入力（例: cor_terisuke, elonmusk）
 2. 議論トピックを入力（例: "AIの倫理的課題について"）
@@ -124,28 +197,33 @@ streamlit run app.py
 ```text
 persona-simulator/
 ├── app.py                 # メインStreamlitアプリ
+├── ingest_accounts.py     # CLI一括取得ツール（NEW!）
 ├── utils/
 │   ├── grok_api.py       # Grok API連携（LLM + 反論生成）
 │   ├── x_api.py          # X API v2連携（投稿取得）
 │   ├── persona.py        # ペルソナ生成
 │   ├── similarity.py     # 類似検索
-│   ├── debate_ui.py      # チャット風UI + ターン制議論（NEW!）
-│   └── error_handler.py  # エラーハンドリング
+│   ├── debate_ui.py      # チャット風UI + ターン制議論
+│   ├── error_handler.py  # エラーハンドリング
+│   └── bootstrap.py      # 共通初期化ユーティリティ（NEW!）
 ├── requirements.txt       # 依存関係
 ├── .streamlit/
 │   ├── secrets.toml      # APIキー（Git非管理）
 │   └── config.toml       # Streamlit設定
 ├── README.md             # このファイル
 ├── X_API_SETUP.md        # X API設定ガイド
-└── test_setup.py         # セットアップテスト
+├── test_setup.py         # セットアップテスト
+├── verify_cache.py       # キャッシュ検証ツール（NEW!）
+└── run_test.sh           # 自動テストスクリプト（NEW!）
 ```
 
 ## 📚 ドキュメント
 
-- 📖 **`FEATURES.md`** - 全機能の詳細説明（チャット風UI、キャッシュ、アカウント管理等）
-- 🚀 **`QUICKSTART.md`** - クイックスタートガイド
-- 🔑 **`X_API_SETUP.md`** - X API設定ガイド
-- 📝 **`RELEASE_NOTES_v2.md`** - v2.0リリースノート
+- 🛠️ **`AGENTS.md`** - コントリビューターガイド（開発フロー、命名規則、Stage1/Stage2の運用方針）
+- 📖 **`FEATURES.md`** - 機能の詳細解説（チャット風UI、キャッシュ、アカウント管理など）
+- 🔑 **`X_API_SETUP.md`** - X API のセットアップ手順とトラブルシューティング
+- 📝 **`RELEASE_NOTES_v2.md`** - リリースノート
+- 🧪 **`TEST_PROCEDURE.md`** - Stage1/Stage2 の統合動作確認手順とチェックリスト
 
 ## ライセンス
 

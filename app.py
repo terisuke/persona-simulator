@@ -8,14 +8,17 @@ import logging
 import json
 import pickle
 import os
+import pandas as pd
+import io
 from datetime import datetime
 from typing import List, Dict, Optional
 
 # 定数定義
-MAX_ACCOUNTS = 10
+MAX_ACCOUNTS = 100  # 一括管理に対応して上限を拡張
 DEFAULT_POST_LIMIT = 20
 TOP_K_RELEVANT_POSTS = 3
 RECENT_CONTEXT_MESSAGES = 3
+BATCH_SIZE = 10  # バッチ処理のサイズ
 
 # 自作モジュール
 from utils.grok_api import GrokAPI
@@ -102,6 +105,167 @@ def load_cache(key: str) -> Optional[any]:
     return None
 
 
+def parse_uploaded_file(uploaded_file) -> List[str]:
+    """
+    アップロードされたファイルをパースしてアカウントリストを取得
+    
+    Args:
+        uploaded_file: Streamlitのアップロードファイルオブジェクト
+        
+    Returns:
+        アカウント名のリスト
+    """
+    try:
+        # ファイル内容を読み込み
+        content = uploaded_file.read()
+        
+        if uploaded_file.name.endswith('.csv'):
+            # CSVファイルの場合
+            df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+            
+            # username列を探す（大文字小文字を区別しない）
+            username_col = None
+            for col in df.columns:
+                if col.lower() in ['username', 'account', 'user', 'name']:
+                    username_col = col
+                    break
+            
+            if username_col is None:
+                # 最初の列を使用
+                username_col = df.columns[0]
+                st.warning(f"username列が見つからないため、最初の列 '{username_col}' を使用します")
+            
+            accounts = df[username_col].astype(str).tolist()
+            
+        elif uploaded_file.name.endswith('.txt'):
+            # テキストファイルの場合（改行区切り）
+            content_str = content.decode('utf-8')
+            accounts = [line.strip() for line in content_str.split('\n') if line.strip()]
+            
+        else:
+            st.error("サポートされていないファイル形式です。CSVまたはTXTファイルをアップロードしてください。")
+            return []
+        
+        # アカウント名をクリーンアップ（@を除去、空白を削除）
+        cleaned_accounts = []
+        for account in accounts:
+            if account and account != 'nan':  # pandasのNaNを除外
+                clean_account = str(account).strip().lstrip('@')
+                if clean_account:
+                    cleaned_accounts.append(clean_account)
+        
+        # 重複を除去
+        unique_accounts = list(dict.fromkeys(cleaned_accounts))
+        
+        logger.info(f"ファイル解析完了: {len(unique_accounts)}アカウント")
+        return unique_accounts
+        
+    except Exception as e:
+        st.error(f"ファイル解析エラー: {str(e)}")
+        logger.error(f"ファイル解析失敗: {str(e)}")
+        return []
+
+
+def check_cache_status(accounts: List[str]) -> Dict[str, str]:
+    """
+    アカウントのキャッシュ状況をチェック
+    
+    Args:
+        accounts: アカウント名のリスト
+        
+    Returns:
+        アカウント名 -> ステータスの辞書
+    """
+    status = {}
+    
+    for account in accounts:
+        cache_key = f"posts_{account}"
+        session_key = f"session_data_{account}"
+        
+        # 既存のエラーステータスは維持
+        existing_status = st.session_state.get('account_status', {}).get(account)
+        if existing_status == 'error':
+            status[account] = 'error'
+            continue
+        
+        # セッション状態をチェック（最優先）
+        if session_key in st.session_state:
+            status[account] = "cached_session"
+        # ファイルキャッシュをチェック
+        elif os.path.exists(os.path.join(CACHE_DIR, f"{cache_key}.pkl")):
+            status[account] = "cached_file"
+        else:
+            status[account] = "pending"
+    
+    return status
+
+
+def initialize_session_state():
+    """セッション状態を初期化"""
+    if 'accounts_list' not in st.session_state:
+        st.session_state['accounts_list'] = ['cor_terisuke']  # デフォルト
+    
+    if 'batch_processing' not in st.session_state:
+        st.session_state['batch_processing'] = False
+    
+    if 'processing_progress' not in st.session_state:
+        st.session_state['processing_progress'] = 0
+    
+    if 'account_status' not in st.session_state:
+        st.session_state['account_status'] = {}
+    
+    if 'account_page' not in st.session_state:
+        st.session_state['account_page'] = 0
+    
+    if 'batch_processed_count' not in st.session_state:
+        st.session_state['batch_processed_count'] = 0
+
+
+def restore_session_from_cache():
+    """キャッシュからセッション状態を復元"""
+    try:
+        # .cacheディレクトリから利用可能なアカウントを検出
+        if os.path.exists(CACHE_DIR):
+            cached_accounts = []
+            for filename in os.listdir(CACHE_DIR):
+                if filename.startswith('posts_') and filename.endswith('.pkl'):
+                    account = filename.replace('posts_', '').replace('.pkl', '')
+                    cached_accounts.append(account)
+            
+            # 既存のアカウントリストとマージ
+            existing_accounts = set(st.session_state.get('accounts_list', []))
+            new_accounts = [acc for acc in cached_accounts if acc not in existing_accounts]
+            
+            if new_accounts:
+                st.session_state['accounts_list'].extend(new_accounts)
+                logger.info(f"キャッシュから{len(new_accounts)}アカウントを復元: {new_accounts}")
+                
+                # キャッシュ状況を更新
+                st.session_state['account_status'] = check_cache_status(st.session_state['accounts_list'])
+                
+                return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"セッション復元エラー: {str(e)}")
+        return False
+
+
+def save_session_state():
+    """セッション状態を保存（必要に応じて）"""
+    try:
+        # 重要な状態をログに記録
+        accounts_count = len(st.session_state.get('accounts_list', []))
+        cached_count = sum(1 for s in st.session_state.get('account_status', {}).values() 
+                          if s in ['cached_session', 'cached_file'])
+        
+        logger.info(f"セッション状態保存: {accounts_count}アカウント, {cached_count}キャッシュ済み")
+        
+    except Exception as e:
+        logger.error(f"セッション状態保存エラー: {str(e)}")
+
+
 def fetch_and_analyze_posts(
     grok_api: GrokAPI, 
     account: str, 
@@ -130,6 +294,8 @@ def fetch_and_analyze_posts(
     if not force_refresh and session_key in st.session_state:
         st.info(f"💾 セッションから@{account}のデータをロード（再取得不要）")
         data = st.session_state[session_key]
+        # ステータスを即時反映
+        st.session_state.setdefault('account_status', {})[account_clean] = 'cached_session'
         return data['posts'], data['persona']
     
     # ファイルキャッシュチェック
@@ -139,6 +305,8 @@ def fetch_and_analyze_posts(
             st.info(f"📦 キャッシュから@{account}のデータをロード")
             # セッション状態にも保存
             st.session_state[session_key] = cached
+            # ステータスを即時反映
+            st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
             return cached['posts'], cached['persona']
     
     # 投稿取得
@@ -152,6 +320,8 @@ def fetch_and_analyze_posts(
     
     if not posts:
         st.warning(f"⚠️ @{account}の投稿が取得できませんでした")
+        # エラーステータスを反映
+        st.session_state.setdefault('account_status', {})[account_clean] = 'error'
         return [], {}
     
     # 取得方法を判定して表示
@@ -181,13 +351,19 @@ def fetch_and_analyze_posts(
         st.success(f"✅ ペルソナ生成完了{enrichment_note}: {persona_profile.get('name', account)}")
     
     # データを保存
-    data = {'posts': posts, 'persona': persona_profile}
+    data = {
+        'posts': posts,
+        'persona': persona_profile,
+        'fetched_at': datetime.now().isoformat()
+    }
     
     # ファイルキャッシュ保存
     cache_data(cache_key, data)
     
     # セッション状態にも保存（自動再実行時に再取得を防ぐ）
     st.session_state[session_key] = data
+    # 成功ステータスを反映
+    st.session_state.setdefault('account_status', {})[account_clean] = 'cached_session'
     
     return posts, persona_profile
 
@@ -212,8 +388,15 @@ def main():
     """メインアプリケーション"""
     
     # セッション状態の初期化
+    initialize_session_state()
     if 'grok_history_summary' not in st.session_state:
         st.session_state['grok_history_summary'] = "会話履歴なし"
+    
+    # キャッシュからセッション状態を復元（初回のみ）
+    if 'session_restored' not in st.session_state:
+        if restore_session_from_cache():
+            st.info("💾 キャッシュからアカウント情報を復元しました")
+        st.session_state['session_restored'] = True
     
     # タイトル
     st.title("💬 Persona Debate Simulator")
@@ -225,6 +408,55 @@ def main():
     🤖 <b>AIエージェント</b> | 🌐 マルチプラットフォーム分析 | 💬 会話履歴保持
     </div>
     """, unsafe_allow_html=True)
+    
+    # 進捗サマリ表示（メインエリア）
+    accounts = st.session_state.get('accounts_list', [])
+    if accounts:
+        status = st.session_state.get('account_status', {})
+        cached_count = sum(1 for s in status.values() if s in ['cached_session', 'cached_file'])
+        pending_count = sum(1 for s in status.values() if s == 'pending')
+        error_count = sum(1 for s in status.values() if s == 'error')
+        
+        # 進捗サマリカード
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "総アカウント数", 
+                len(accounts),
+                help="登録されているアカウントの総数"
+            )
+        
+        with col2:
+            st.metric(
+                "キャッシュ済み", 
+                cached_count,
+                delta=f"{cached_count/len(accounts)*100:.1f}%" if accounts else "0%",
+                help="データが取得済みのアカウント数"
+            )
+        
+        with col3:
+            st.metric(
+                "取得待ち", 
+                pending_count,
+                delta=f"{pending_count/len(accounts)*100:.1f}%" if accounts else "0%",
+                help="まだデータを取得していないアカウント数"
+            )
+        
+        with col4:
+            st.metric(
+                "エラー", 
+                error_count,
+                delta=f"{error_count/len(accounts)*100:.1f}%" if accounts else "0%",
+                help="データ取得に失敗したアカウント数"
+            )
+        
+        # 進捗バー
+        if accounts:
+            progress = cached_count / len(accounts)
+            st.progress(progress, text=f"データ取得進捗: {cached_count}/{len(accounts)} ({progress*100:.1f}%)")
+        
+        st.markdown("---")
     
     # サイドバー
     with st.sidebar:
@@ -244,22 +476,94 @@ def main():
         else:
             st.info("ℹ️ X API未設定（サンプル投稿生成）")
         
-        # アカウント管理（追加ボタン方式）
+        # アカウント管理（一括アップロード対応）
         st.subheader("📝 Xアカウント管理")
         
-        # セッション状態でアカウントリストを管理
-        if 'accounts_list' not in st.session_state:
-            st.session_state['accounts_list'] = ['cor_terisuke']  # デフォルト
+        # 一括アップロードセクション
+        st.markdown("**📁 一括アップロード**")
+        uploaded_file = st.file_uploader(
+            "CSVまたはTXTファイルをアップロード",
+            type=['csv', 'txt'],
+            help="CSV: username列を含むファイル\nTXT: 改行区切りでアカウント名を記載"
+        )
         
-        # 現在のアカウントリストを表示
-        if st.session_state['accounts_list']:
+        if uploaded_file is not None:
+            if st.button("📥 ファイルからアカウントを読み込み", type="primary"):
+                accounts_from_file = parse_uploaded_file(uploaded_file)
+                if accounts_from_file:
+                    # 既存のアカウントとマージ（重複除去）
+                    existing_accounts = set(st.session_state['accounts_list'])
+                    new_accounts = [acc for acc in accounts_from_file if acc not in existing_accounts]
+                    
+                    if new_accounts:
+                        st.session_state['accounts_list'].extend(new_accounts)
+                        st.success(f"✅ {len(new_accounts)}アカウントを追加しました")
+                    else:
+                        st.info("新しいアカウントはありませんでした")
+                    
+                    # キャッシュ状況を更新
+                    st.session_state['account_status'] = check_cache_status(st.session_state['accounts_list'])
+                    st.rerun()
+        
+        st.markdown("---")
+        
+        # 現在のアカウントリスト表示
+        accounts = st.session_state['accounts_list']
+        if accounts:
+            # 進捗サマリ表示
+            status = st.session_state.get('account_status', {})
+            cached_count = sum(1 for s in status.values() if s in ['cached_session', 'cached_file'])
+            pending_count = sum(1 for s in status.values() if s == 'pending')
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("総アカウント数", len(accounts))
+            with col2:
+                st.metric("キャッシュ済み", cached_count)
+            with col3:
+                st.metric("取得待ち", pending_count)
+            
             st.markdown("**登録済みアカウント:**")
-            for i, acc in enumerate(st.session_state['accounts_list']):
-                col1, col2, col3 = st.columns([3, 1, 1])
+            
+            # ページング対応（10件ずつ表示）
+            page_size = 10
+            total_pages = (len(accounts) + page_size - 1) // page_size
+            current_page = st.session_state.get('account_page', 0)
+            
+            if total_pages > 1:
+                col1, col2, col3 = st.columns([1, 2, 1])
                 with col1:
-                    st.text(f"@{acc}")
+                    if st.button("◀️", disabled=(current_page == 0)):
+                        st.session_state['account_page'] = max(0, current_page - 1)
+                        st.rerun()
                 with col2:
-                    if st.button("🔄", key=f"refresh_{i}", help=f"@{acc}の投稿を再取得"):
+                    st.caption(f"ページ {current_page + 1} / {total_pages}")
+                with col3:
+                    if st.button("▶️", disabled=(current_page >= total_pages - 1)):
+                        st.session_state['account_page'] = min(total_pages - 1, current_page + 1)
+                        st.rerun()
+            
+            # 現在のページのアカウントを表示
+            start_idx = current_page * page_size
+            end_idx = min(start_idx + page_size, len(accounts))
+            page_accounts = accounts[start_idx:end_idx]
+            
+            for i, acc in enumerate(page_accounts):
+                actual_idx = start_idx + i
+                col1, col2, col3 = st.columns([3, 1, 1])
+                
+                with col1:
+                    # ステータス表示
+                    acc_status = status.get(acc, 'pending')
+                    if acc_status == 'cached_session':
+                        st.text(f"@{acc} ✅")
+                    elif acc_status == 'cached_file':
+                        st.text(f"@{acc} 📦")
+                    else:
+                        st.text(f"@{acc} ⏳")
+                
+                with col2:
+                    if st.button("🔄", key=f"refresh_{actual_idx}", help=f"@{acc}の投稿を再取得"):
                         # 個別アカウントのキャッシュをクリア
                         session_key = f"session_data_{acc}"
                         if session_key in st.session_state:
@@ -271,9 +575,10 @@ def main():
                             del st.session_state['cached_accounts_key']
                         st.success(f"✅ @{acc}の投稿を再取得します")
                         st.rerun()
+                
                 with col3:
-                    if st.button("🗑️", key=f"delete_{i}", help=f"@{acc}を削除"):
-                        st.session_state['accounts_list'].pop(i)
+                    if st.button("🗑️", key=f"delete_{actual_idx}", help=f"@{acc}を削除"):
+                        st.session_state['accounts_list'].pop(actual_idx)
                         # セッションキャッシュも削除
                         session_key = f"session_data_{acc}"
                         if session_key in st.session_state:
@@ -283,13 +588,16 @@ def main():
                             del st.session_state['all_data_cache']
                         if 'cached_accounts_key' in st.session_state:
                             del st.session_state['cached_accounts_key']
+                        # ページを調整
+                        if current_page > 0 and len(st.session_state['accounts_list']) <= current_page * page_size:
+                            st.session_state['account_page'] = max(0, current_page - 1)
                         st.rerun()
         
         st.markdown("---")
         
-        # 新規アカウント追加
-        if len(st.session_state['accounts_list']) < MAX_ACCOUNTS:
-            st.markdown("**アカウント追加:**")
+        # 新規アカウント追加（個別）
+        if len(accounts) < MAX_ACCOUNTS:
+            st.markdown("**➕ 個別アカウント追加:**")
             new_account = st.text_input(
                 "アカウント名を入力",
                 value="",
@@ -303,7 +611,7 @@ def main():
                 if st.button("➕ アカウント追加", type="primary", use_container_width=True):
                     if new_account.strip():
                         clean_account = new_account.strip().lstrip('@')
-                        if clean_account not in st.session_state['accounts_list']:
+                        if clean_account not in accounts:
                             st.session_state['accounts_list'].append(clean_account)
                             st.success(f"✅ @{clean_account}を追加しました")
                             st.rerun()
@@ -315,6 +623,7 @@ def main():
             with col2:
                 if st.button("🔄 リセット", use_container_width=True):
                     st.session_state['accounts_list'] = ['cor_terisuke']
+                    st.session_state['account_page'] = 0
                     st.success("デフォルトにリセットしました")
                     st.rerun()
         else:
@@ -356,6 +665,31 @@ def main():
                     st.session_state['grok_history_summary'] = "会話履歴なし"
                     st.success("会話履歴をクリアしました")
                     st.rerun()
+        
+        st.divider()
+        
+        # バッチ処理セクション
+        st.subheader("⚡ バッチ処理")
+        
+        # 不足分を取得ボタン
+        if accounts:
+            pending_accounts = [acc for acc, status in st.session_state.get('account_status', {}).items() 
+                              if status == 'pending']
+            
+            if pending_accounts:
+                st.info(f"⏳ {len(pending_accounts)}アカウントの取得待ちがあります")
+                
+                if st.button("🚀 不足分を取得", type="primary", use_container_width=True):
+                    st.session_state['batch_processing'] = True
+                    st.session_state['processing_progress'] = 0
+                    st.rerun()
+            else:
+                st.success("✅ 全アカウントのデータが揃っています")
+        
+        # バッチ処理中の進捗表示
+        if st.session_state.get('batch_processing', False):
+            st.progress(st.session_state.get('processing_progress', 0))
+            st.info("🔄 バッチ処理中...")
         
         st.divider()
         
@@ -403,11 +737,105 @@ def main():
                     del st.session_state['cached_accounts_key']
                 st.success("✅ キャッシュをクリアしました")
                 st.rerun()
+
+        # エラー一覧（429等の失敗を可視化）
+        st.markdown("---")
+        st.subheader("❌ エラー一覧")
+        error_accounts = [acc for acc, s in st.session_state.get('account_status', {}).items() if s == 'error']
+        if error_accounts:
+            err_df = pd.DataFrame({"アカウント": [f"@{a}" for a in error_accounts]})
+            st.dataframe(err_df, width='content', hide_index=True)
+            if st.button("🔁 エラーを再試行", use_container_width=True):
+                # エラー状態をpendingへ戻し、次のバッチで再取得
+                for a in error_accounts:
+                    st.session_state['account_status'][a] = 'pending'
+                # サマリ・メトリクスを即時更新
+                st.session_state['account_status'] = check_cache_status(st.session_state.get('accounts_list', []))
+                st.session_state['batch_processing'] = True
+                st.session_state['processing_progress'] = 0
+                st.success("再試行を開始しました")
+                st.rerun()
+        else:
+            st.caption("現在エラーはありません")
     
     # メインエリア
     if not accounts:
         st.info("👈 サイドバーからXアカウントを入力してください")
         return
+    
+    # バッチ処理の実行
+    if st.session_state.get('batch_processing', False):
+        pending_accounts = [acc for acc, status in st.session_state.get('account_status', {}).items() 
+                          if status == 'pending']
+        
+        if pending_accounts and grok_api:
+            # バッチサイズで分割して処理
+            total_pending = len(pending_accounts)
+            processed = st.session_state.get('batch_processed_count', 0)
+            
+            if processed < total_pending:
+                # 次のバッチを処理
+                start_idx = processed
+                end_idx = min(start_idx + BATCH_SIZE, total_pending)
+                current_batch = pending_accounts[start_idx:end_idx]
+                
+                st.info(f"🔄 バッチ処理中: {processed + 1}-{end_idx} / {total_pending}")
+                
+                # プログレスバーを更新
+                progress = (processed + len(current_batch)) / total_pending
+                st.session_state['processing_progress'] = progress
+                
+                # バッチ内のアカウントを処理
+                for i, account in enumerate(current_batch):
+                    with st.spinner(f"📡 @{account}のデータを取得中... ({i+1}/{len(current_batch)})"):
+                        try:
+                            posts, persona = fetch_and_analyze_posts(
+                                grok_api, 
+                                account, 
+                                use_cache=True, 
+                                x_api=x_api,
+                                force_refresh=False
+                            )
+                            
+                            if posts and persona:
+                                # ステータスを更新
+                                st.session_state['account_status'][account] = 'cached_session'
+                                st.success(f"✅ @{account}のデータを取得完了")
+                            else:
+                                st.warning(f"⚠️ @{account}のデータ取得に失敗")
+                                st.session_state['account_status'][account] = 'error'
+                                
+                        except Exception as e:
+                            st.error(f"❌ @{account}の処理中にエラー: {str(e)}")
+                            logger.error(f"バッチ処理エラー @{account}: {str(e)}")
+                            st.session_state['account_status'][account] = 'error'
+                
+                # 処理済みカウントを更新
+                st.session_state['batch_processed_count'] = end_idx
+                
+                # 全て完了したかチェック
+                if end_idx >= total_pending:
+                    st.session_state['batch_processing'] = False
+                    st.session_state['batch_processed_count'] = 0
+                    st.success("🎉 バッチ処理が完了しました！")
+                    st.rerun()
+                else:
+                    # 次のバッチのために少し待機
+                    import time
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                # 処理完了
+                st.session_state['batch_processing'] = False
+                st.session_state['batch_processed_count'] = 0
+                st.success("🎉 バッチ処理が完了しました！")
+                st.rerun()
+        else:
+            # 処理対象なし
+            st.session_state['batch_processing'] = False
+            st.session_state['batch_processed_count'] = 0
+            st.info("処理対象のアカウントがありません")
+            st.rerun()
     
     # アカウントリストの変更を検知
     if 'previous_accounts' not in st.session_state:
@@ -429,8 +857,11 @@ def main():
             del st.session_state[session_key]
             logger.info(f"削除されたアカウント @{removed} のキャッシュをクリア")
     
-    # アカウントリストを更新
-    st.session_state['previous_accounts'] = accounts
+    # アカウントリストを更新（同一参照を避けるためコピーを保存）
+    st.session_state['previous_accounts'] = list(accounts)
+    
+    # キャッシュ状況を更新
+    st.session_state['account_status'] = check_cache_status(accounts)
     
     # all_dataもセッション状態で管理（再取得を防ぐ）
     all_data_key = "all_data_cache"
@@ -446,18 +877,33 @@ def main():
         logger.info("all_dataを新規取得")
         all_data = {}
         for account in accounts:
-            # 新しいアカウントの場合は強制再取得
-            force_refresh = account in new_accounts
-            if force_refresh:
-                st.info(f"🆕 新しいアカウント: @{account} - 投稿を取得します")
-            
-            posts, persona = fetch_and_analyze_posts(
-                grok_api, 
-                account, 
-                use_cache, 
-                x_api,
-                force_refresh=force_refresh
-            )
+            # まずファイルキャッシュを明示的に確認（CLI→UI 連携を最優先）
+            account_clean = account.lstrip('@')
+            cache_key = f"posts_{account_clean}"
+            session_key = f"session_data_{account_clean}"
+            cached_data = load_cache(cache_key) if use_cache else None
+
+            # 新しいアカウントでもキャッシュがあれば再取得しない
+            force_refresh = (account in new_accounts) and (cached_data is None)
+            if account in new_accounts and not force_refresh:
+                st.info(f"📦 新しいアカウント: @{account} - キャッシュから即時ロード")
+
+            if cached_data is not None and not force_refresh:
+                # キャッシュから復元してスキップ
+                st.session_state[session_key] = cached_data
+                st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
+                posts = cached_data.get('posts', [])
+                persona = cached_data.get('persona', {})
+            else:
+                if force_refresh:
+                    st.info(f"🆕 新しいアカウント: @{account} - 投稿を取得します")
+                posts, persona = fetch_and_analyze_posts(
+                    grok_api, 
+                    account, 
+                    use_cache, 
+                    x_api,
+                    force_refresh=force_refresh
+                )
             all_data[account] = {
                 'posts': posts,
                 'persona': persona
@@ -469,7 +915,7 @@ def main():
         logger.info(f"all_dataをセッションキャッシュに保存: {len(all_data)}アカウント")
     
     # タブ作成
-    tabs = st.tabs(["🎯 議論シミュレーション", "👤 ペルソナ分析", "📊 投稿データ"])
+    tabs = st.tabs(["🎯 議論シミュレーション", "👤 ペルソナ分析", "📊 投稿データ", "📋 アカウント管理"])
     
     # === タブ1: 議論シミュレーション（チャット風UI + ターン制） ===
     with tabs[0]:
@@ -763,6 +1209,179 @@ def main():
                 st.info(f"残り{len(posts) - 10}件の投稿は非表示")
             
             st.markdown("---")
+    
+    # === タブ4: アカウント管理 ===
+    with tabs[3]:
+        st.header("📋 アカウント管理")
+        
+        if not all_data:
+            st.warning("アカウントデータがありません")
+        else:
+            # フィルタリングオプション
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                status_filter = st.selectbox(
+                    "ステータスでフィルタ",
+                    options=["全て", "キャッシュ済み", "取得待ち", "エラー"],
+                    help="アカウントのステータスでフィルタリング"
+                )
+            
+            with col2:
+                search_term = st.text_input(
+                    "アカウント名で検索",
+                    placeholder="アカウント名の一部を入力",
+                    help="アカウント名の一部で検索"
+                )
+            
+            with col3:
+                sort_option = st.selectbox(
+                    "並び順",
+                    options=["アカウント名", "ステータス", "投稿数"],
+                    help="表示順序を選択"
+                )
+            
+            # フィルタリングとソート
+            filtered_accounts = []
+            for account, data in all_data.items():
+                # ステータスフィルタ
+                account_status = st.session_state.get('account_status', {}).get(account, 'pending')
+                if status_filter == "全て":
+                    pass
+                elif status_filter == "キャッシュ済み" and account_status not in ['cached_session', 'cached_file']:
+                    continue
+                elif status_filter == "取得待ち" and account_status != 'pending':
+                    continue
+                elif status_filter == "エラー" and account_status != 'error':
+                    continue
+                
+                # 検索フィルタ
+                if search_term and search_term.lower() not in account.lower():
+                    continue
+                
+                filtered_accounts.append((account, data, account_status))
+            
+            # ソート
+            if sort_option == "アカウント名":
+                filtered_accounts.sort(key=lambda x: x[0])
+            elif sort_option == "ステータス":
+                filtered_accounts.sort(key=lambda x: x[2])
+            elif sort_option == "投稿数":
+                filtered_accounts.sort(key=lambda x: len(x[1].get('posts', [])), reverse=True)
+            
+            # 結果表示
+            st.markdown(f"**表示中: {len(filtered_accounts)} / {len(all_data)} アカウント**")
+            
+            if filtered_accounts:
+                # データフレーム形式で表示
+                display_data = []
+                for account, data, status in filtered_accounts:
+                    posts = data.get('posts', [])
+                    persona = data.get('persona', {})
+                    
+                    # ステータス表示
+                    status_display = {
+                        'cached_session': '✅ セッション',
+                        'cached_file': '📦 ファイル',
+                        'pending': '⏳ 待機中',
+                        'error': '❌ エラー'
+                    }.get(status, '❓ 不明')
+                    
+                    # キャッシュ日時を取得
+                    cache_time = "不明"
+                    if status in ['cached_session', 'cached_file']:
+                        fetched_at = None
+                        # セッションにあれば優先
+                        session_key = f"session_data_{account}"
+                        if session_key in st.session_state:
+                            fetched_at = st.session_state[session_key].get('fetched_at')
+                        if not fetched_at:
+                            # ファイルキャッシュから取得
+                            cached = load_cache(f"posts_{account}")
+                            if cached:
+                                fetched_at = cached.get('fetched_at')
+                        if fetched_at:
+                            try:
+                                cache_time = datetime.fromisoformat(fetched_at).strftime("%Y-%m-%d %H:%M")
+                            except Exception:
+                                cache_time = fetched_at
+                    
+                    display_data.append({
+                        "アカウント": f"@{account}",
+                        "ステータス": status_display,
+                        "投稿数": len(posts),
+                        "ペルソナ名": persona.get('name', account),
+                        "キャッシュ日時": cache_time
+                    })
+                
+                # データフレーム表示
+                df = pd.DataFrame(display_data)
+                st.dataframe(
+                    df,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "アカウント": st.column_config.TextColumn("アカウント", width="medium"),
+                        "ステータス": st.column_config.TextColumn("ステータス", width="small"),
+                        "投稿数": st.column_config.NumberColumn("投稿数", width="small"),
+                        "ペルソナ名": st.column_config.TextColumn("ペルソナ名", width="medium"),
+                        "キャッシュ日時": st.column_config.TextColumn("キャッシュ日時", width="small")
+                    }
+                )
+                
+                # 一括操作ボタン
+                st.markdown("---")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if st.button("🔄 選択したアカウントを再取得", use_container_width=True):
+                        # フィルタされたアカウントを再取得
+                        for account, _, _ in filtered_accounts:
+                            session_key = f"session_data_{account}"
+                            if session_key in st.session_state:
+                                del st.session_state[session_key]
+                        if 'all_data_cache' in st.session_state:
+                            del st.session_state['all_data_cache']
+                        if 'cached_accounts_key' in st.session_state:
+                            del st.session_state['cached_accounts_key']
+                        st.success("選択したアカウントの再取得を開始します")
+                        st.rerun()
+                
+                with col2:
+                    if st.button("📥 データをエクスポート", use_container_width=True):
+                        # 全データをJSONでエクスポート
+                        export_data = {}
+                        for account, data, _ in filtered_accounts:
+                            export_data[account] = {
+                                'posts': data.get('posts', []),
+                                'persona': data.get('persona', {})
+                            }
+                        
+                        json_data = json.dumps(export_data, ensure_ascii=False, indent=2)
+                        st.download_button(
+                            label="📥 JSONダウンロード",
+                            data=json_data,
+                            file_name=f"persona_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json"
+                        )
+                
+                with col3:
+                    if st.button("🗑️ 選択したアカウントを削除", use_container_width=True):
+                        # フィルタされたアカウントを削除
+                        for account, _, _ in filtered_accounts:
+                            if account in st.session_state['accounts_list']:
+                                st.session_state['accounts_list'].remove(account)
+                            session_key = f"session_data_{account}"
+                            if session_key in st.session_state:
+                                del st.session_state[session_key]
+                        if 'all_data_cache' in st.session_state:
+                            del st.session_state['all_data_cache']
+                        if 'cached_accounts_key' in st.session_state:
+                            del st.session_state['cached_accounts_key']
+                        st.success("選択したアカウントを削除しました")
+                        st.rerun()
+            else:
+                st.info("フィルタ条件に一致するアカウントがありません")
     
     # フッター
     st.markdown("---")

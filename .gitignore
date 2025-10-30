@@ -40,6 +40,7 @@ wheels/
 
 # Logs
 *.log
+test_*.log
 
 # OS
 .DS_Store
@@ -49,3 +50,7 @@ Thumbs.db
 .env
 .env.local
 
+# Local test artifacts
+test_accounts*.txt
+test_statistics.txt
+test_429_*

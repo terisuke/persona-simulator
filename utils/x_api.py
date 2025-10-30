@@ -27,6 +27,51 @@ class XAPIClient:
             "Authorization": f"Bearer {bearer_token}",
             "Content-Type": "application/json"
         }
+
+    def _wait_for_rate_limit_reset(self, response_headers: Dict[str, str]) -> bool:
+        """
+        レートリミットリセットまで待機
+        
+        Args:
+            response_headers: 429レスポンスのヘッダー
+            
+        Returns:
+            待機を実行した場合True、ヘッダーが無効な場合False
+        """
+        if 'x-rate-limit-reset' not in response_headers:
+            logger.warning("x-rate-limit-reset ヘッダーが見つかりません")
+            return False
+        
+        try:
+            import time
+            from datetime import datetime
+            
+            reset_timestamp = int(response_headers['x-rate-limit-reset'])
+            reset_time = datetime.fromtimestamp(reset_timestamp)
+            now = datetime.now()
+            wait_seconds = (reset_time - now).total_seconds()
+            
+            if wait_seconds <= 0:
+                logger.info("レートリミットは既にリセット済みです")
+                return True
+            
+            # 最大15分（900秒）まで待機
+            if wait_seconds > 900:
+                logger.warning(f"待機時間が長すぎます（{int(wait_seconds)}秒）。15分に制限します")
+                wait_seconds = 900
+            
+            logger.warning(
+                f"⏳ X APIレートリミット到達。リセットまで {int(wait_seconds)}秒（約{int(wait_seconds/60)}分）待機します..."
+            )
+            logger.info(f"リセット時刻: {reset_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            time.sleep(wait_seconds + 5)  # 余裕を持って5秒追加
+            logger.info("✅ レートリミット待機完了。リトライします")
+            return True
+            
+        except (ValueError, KeyError) as e:
+            logger.error(f"レートリミットヘッダーの解析に失敗: {e}")
+            return False
     
     def fetch_user_tweets(
         self, 
@@ -54,7 +99,7 @@ class XAPIClient:
                     logger.error(f"ユーザーIDが見つかりません: @{username}")
                     return []
                 
-                # ステップ2: ユーザーのツイートを取得
+                # ステップ2: ユーザーのツイートを取得（429時は1回リトライ）
                 endpoint = f"{self.BASE_URL}/users/{user_id}/tweets"
                 
                 params = {
@@ -63,44 +108,61 @@ class XAPIClient:
                     "exclude": "retweets,replies"  # RTと返信を除外
                 }
                 
-                response = requests.get(
-                    endpoint,
-                    headers=self.headers,
-                    params=params,
-                    timeout=15
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    tweets = []
-                    
-                    if "data" in data:
-                        for tweet in data["data"]:
-                            tweets.append({
-                                "id": tweet.get("id", ""),
-                                "text": tweet.get("text", ""),
-                                "link": f"https://x.com/{username}/status/{tweet.get('id', '')}",
-                                "date": tweet.get("created_at", "")
-                            })
-                    
-                    logger.info(f"取得完了: {len(tweets)}件のツイート")
-                    return tweets
-                
-                elif response.status_code == 429:
-                    logger.error("X APIレート制限に達しました")
-                    raise APIConnectionError("⚠️ X APIレート制限に達しました。時間をおいて再試行してください。")
-                
-                elif response.status_code == 401:
-                    logger.error("X API認証エラー")
-                    raise APIConnectionError("🔑 X API認証エラー。Bearer Tokenを確認してください。")
-                
-                else:
-                    error_msg = ErrorHandler.handle_api_error(
-                        Exception(f"Status {response.status_code}: {response.text}"),
-                        "X API"
+                # 最大2回試行（初回 + 429リトライ1回）
+                for attempt in range(2):
+                    response = requests.get(
+                        endpoint,
+                        headers=self.headers,
+                        params=params,
+                        timeout=15
                     )
-                    logger.error(error_msg)
-                    raise APIConnectionError(error_msg)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        tweets = []
+                        
+                        if "data" in data:
+                            for tweet in data["data"]:
+                                tweets.append({
+                                    "id": tweet.get("id", ""),
+                                    "text": tweet.get("text", ""),
+                                    "link": f"https://x.com/{username}/status/{tweet.get('id', '')}",
+                                    "date": tweet.get("created_at", "")
+                                })
+                        
+                        logger.info(f"取得完了: {len(tweets)}件のツイート")
+                        return tweets
+                    
+                    elif response.status_code == 429:
+                        if attempt == 0:
+                            # 初回の429エラー: リセットまで待機してリトライ
+                            logger.warning("X APIレートリミットに達しました")
+                            if self._wait_for_rate_limit_reset(response.headers):
+                                logger.info("リトライします（2回目の試行）")
+                                continue  # リトライ
+                            else:
+                                # ヘッダーが無効な場合は例外を投げる
+                                logger.error("レートリミット情報が取得できませんでした")
+                                raise APIConnectionError("⚠️ X APIレートリミットに達しました。時間をおいて再試行してください。")
+                        else:
+                            # 2回目も429: 諦めて例外を投げる
+                            logger.error("リトライ後もレートリミットエラーが継続しています")
+                            raise APIConnectionError("⚠️ X APIレートリミットに達しました。時間をおいて再試行してください。")
+                    
+                    elif response.status_code == 401:
+                        logger.error("X API認証エラー")
+                        raise APIConnectionError("🔑 X API認証エラー。Bearer Tokenを確認してください。")
+                    
+                    else:
+                        error_msg = ErrorHandler.handle_api_error(
+                            Exception(f"Status {response.status_code}: {response.text}"),
+                            "X API"
+                        )
+                        logger.error(error_msg)
+                        raise APIConnectionError(error_msg)
+                
+                # ループを抜けた場合（通常はここに到達しない）
+                raise APIConnectionError("予期しないエラー: リトライループが完了しました")
         
         except APIConnectionError:
             raise
@@ -167,31 +229,53 @@ class XAPIClient:
                 "tweet.fields": "created_at,text,id"
             }
             
-            response = requests.get(
-                endpoint,
-                headers=self.headers,
-                params=params,
-                timeout=15
-            )
+            # 最大2回試行（初回 + 429リトライ1回）
+            for attempt in range(2):
+                response = requests.get(
+                    endpoint,
+                    headers=self.headers,
+                    params=params,
+                    timeout=15
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    tweets = []
+                    
+                    if "data" in data:
+                        for tweet in data["data"]:
+                            tweets.append({
+                                "id": tweet.get("id", ""),
+                                "text": tweet.get("text", ""),
+                                "link": f"https://x.com/i/status/{tweet.get('id', '')}",
+                                "date": tweet.get("created_at", "")
+                            })
+                    
+                    logger.info(f"検索完了: {len(tweets)}件")
+                    return tweets
+                
+                elif response.status_code == 429:
+                    if attempt == 0:
+                        # 初回の429エラー: リセットまで待機してリトライ
+                        logger.warning("X API検索でレートリミットに達しました")
+                        if self._wait_for_rate_limit_reset(response.headers):
+                            logger.info("検索をリトライします（2回目の試行）")
+                            continue  # リトライ
+                        else:
+                            # ヘッダーが無効な場合は空リストを返す
+                            logger.error("レートリミット情報が取得できませんでした")
+                            return []
+                    else:
+                        # 2回目も429: 空リストを返す
+                        logger.error("検索リトライ後もレートリミットエラーが継続しています")
+                        return []
+                
+                else:
+                    logger.error(f"検索失敗: {response.status_code}")
+                    return []
             
-            if response.status_code == 200:
-                data = response.json()
-                tweets = []
-                
-                if "data" in data:
-                    for tweet in data["data"]:
-                        tweets.append({
-                            "id": tweet.get("id", ""),
-                            "text": tweet.get("text", ""),
-                            "link": f"https://x.com/i/status/{tweet.get('id', '')}",
-                            "date": tweet.get("created_at", "")
-                        })
-                
-                logger.info(f"検索完了: {len(tweets)}件")
-                return tweets
-            else:
-                logger.error(f"検索失敗: {response.status_code}")
-                return []
+            # ループを抜けた場合
+            return []
         
         except Exception as e:
             logger.error(f"検索エラー: {str(e)}")
