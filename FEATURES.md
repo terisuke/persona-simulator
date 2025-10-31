@@ -434,7 +434,7 @@ streamlit run app.py 2>&1 | grep "ERROR\|WARNING"
 ## 📚 関連ドキュメント
 
 - `README.md` - プロジェクト概要
-- `QUICKSTART.md` - クイックスタート
+- `README.md` - クイックスタートとセットアップ
 - `X_API_SETUP.md` - X API設定ガイド
 - `RELEASE_NOTES_v2.md` - v2.0リリースノート
 
@@ -451,4 +451,3 @@ Persona Debate Simulator v2.0は、以下を実現しました：
 ✅ **AIエージェント** - 文脈維持、Web検索、マルチプラットフォーム  
 
 プロダクションレベルの品質と使いやすさを兼ね備えたツールです！🎉
-
