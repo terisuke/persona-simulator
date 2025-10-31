@@ -78,16 +78,23 @@ def load_grok_api_from_env() -> Optional['GrokAPI']:
         return None
 
 
-def load_x_api_from_env() -> Optional['XAPIClient']:
+def load_x_api_from_env(use_x_api: bool = True) -> Optional['XAPIClient']:
     """
     環境変数から X API v2 インスタンスをロード (オプション)
 
     環境変数:
         X_BEARER_TOKEN: X API Bearer Token (オプション)
 
+    Args:
+        use_x_api: X APIを使用するかどうか（Falseの場合は常にNoneを返す）
+
     Returns:
         XAPIClient インスタンスまたは None
     """
+    if not use_x_api:
+        logger.info("X APIを使用しない設定のためスキップ")
+        return None
+
     from utils.x_api import XAPIClient
 
     try:
@@ -140,19 +147,26 @@ def load_secrets_from_toml(toml_path: str = ".streamlit/secrets.toml") -> Dict[s
         return {}
 
 
-def read_accounts_from_file(file_path: str) -> List[str]:
+def read_accounts_from_file(
+    file_path: str,
+    with_metadata: bool = False
+) -> List[str] | List[Dict[str, str]]:
     """
-    ファイルからアカウントリストを読み込み
+    ファイルからアカウントリストを読み込み（Stage 2.5: source 列対応）
 
     サポート形式:
-        - CSV: account列を持つCSVファイル
+        - CSV: account/username/name/handle 列を持つCSVファイル
+          - オプション: source 列（grok_keyword, grok_random 等）
         - TXT: 1行1アカウントのテキストファイル
 
     Args:
         file_path: アカウントリストファイルのパス
+        with_metadata: True の場合、メタデータ（source 等）を含む Dict のリストを返す
 
     Returns:
-        アカウント名のリスト
+        with_metadata=False: アカウント名のリスト (List[str])
+        with_metadata=True: メタデータを含む Dict のリスト (List[Dict[str, str]])
+            [{"handle": str, "source": str}, ...]
     """
     accounts = []
     file_path_obj = Path(file_path)
@@ -178,17 +192,224 @@ def read_accounts_from_file(file_path: str) -> List[str]:
                 logger.error(f"CSV に account/username/name/handle 列が見つかりません")
                 return accounts
 
-            accounts = df[account_col].dropna().astype(str).tolist()
+            # source 列の有無を確認（Stage 2.5）
+            has_source = 'source' in df.columns
+
+            if with_metadata:
+                # メタデータを含む Dict のリストを返す
+                for _, row in df.iterrows():
+                    handle = str(row[account_col]).strip().lstrip('@')
+                    source = str(row['source']) if has_source and not pd.isna(row.get('source')) else 'unknown'
+                    if handle:  # 空でない行のみ
+                        accounts.append({
+                            'handle': handle,
+                            'source': source
+                        })
+            else:
+                # 既存の互換性: アカウント名のみのリストを返す
+                accounts = df[account_col].dropna().astype(str).tolist()
+                # @記号を除去
+                accounts = [acc.strip().lstrip('@') for acc in accounts]
         else:
             # テキスト形式 (1行1アカウント)
             with open(file_path, 'r', encoding='utf-8') as f:
-                accounts = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
-        # @記号を除去してクリーンアップ
-        accounts = [acc.lstrip('@') for acc in accounts]
-        logger.info(f"{len(accounts)} 件のアカウントを読み込みました: {file_path}")
+            if with_metadata:
+                # メタデータを含む Dict のリストを返す
+                for line in lines:
+                    handle = line.lstrip('@')
+                    accounts.append({
+                        'handle': handle,
+                        'source': 'unknown'  # TXT ファイルには source 情報なし
+                    })
+            else:
+                # 既存の互換性: アカウント名のみのリストを返す
+                accounts = [line.lstrip('@') for line in lines]
+
+        if with_metadata:
+            logger.info(f"{len(accounts)} 件のアカウント（メタデータ付き）を読み込みました: {file_path}")
+        else:
+            logger.info(f"{len(accounts)} 件のアカウントを読み込みました: {file_path}")
 
     except Exception as e:
         logger.error(f"アカウントリスト読み込み失敗: {str(e)}")
 
     return accounts
+
+
+# =============================================================================
+# Stage3 多 SNS 連携: API 初期化 Skeleton
+# =============================================================================
+#
+# 以下は Stage3 で実装予定の他 SNS プラットフォーム向け API クライアント初期化関数です。
+# 各関数は環境変数から認証情報を読み込み、対応する API クライアントインスタンスを返します。
+#
+# 推奨 SDK:
+#   - Facebook/Instagram: facebook-sdk または公式 Graph API
+#     (https://developers.facebook.com/docs/graph-api/)
+#   - LinkedIn: linkedin-api または公式 Marketing Developer Platform
+#     (https://learn.microsoft.com/linkedin/marketing/)
+#   - TikTok: TikTok for Developers / Research API
+#     (https://developers.tiktok.com/)
+#
+# 実装時の注意:
+#   - 各 API のレートリミット管理は個別に実装
+#   - 取得したデータは FetchResult.source に適切なソース名を設定
+#   - エラーハンドリングを統一（Optional 返却、ログ出力）
+# =============================================================================
+
+
+def load_facebook_api_from_env() -> Optional[Any]:
+    """
+    環境変数から Facebook Graph API インスタンスをロード（Stage3 実装予定）
+
+    環境変数:
+        FACEBOOK_APP_ID: Facebook アプリケーション ID
+        FACEBOOK_APP_SECRET: Facebook アプリケーション Secret
+        FACEBOOK_ACCESS_TOKEN: Facebook Graph API アクセストークン（オプション）
+
+    Returns:
+        Facebook API クライアントインスタンスまたは None
+
+    Raises:
+        NotImplementedError: Stage3 で実装予定
+
+    参考:
+        https://developers.facebook.com/docs/graph-api/
+    """
+    logger.warning("Facebook API は Stage3 で実装予定です")
+    # Stage3 実装例:
+    # try:
+    #     app_id = os.environ.get("FACEBOOK_APP_ID")
+    #     app_secret = os.environ.get("FACEBOOK_APP_SECRET")
+    #     access_token = os.environ.get("FACEBOOK_ACCESS_TOKEN")  # オプション: サーバー間認証で生成も可
+    #
+    #     if not app_id or not app_secret:
+    #         logger.info("FACEBOOK_APP_ID または FACEBOOK_APP_SECRET が設定されていません（オプション）")
+    #         return None
+    #
+    #     from utils.facebook_api import FacebookAPIClient
+    #     return FacebookAPIClient(app_id=app_id, app_secret=app_secret, access_token=access_token)
+    # except Exception as e:
+    #     logger.warning(f"Facebook API初期化エラー(続行可能): {str(e)}")
+    #     return None
+    return None
+
+
+def load_instagram_api_from_env() -> Optional[Any]:
+    """
+    環境変数から Instagram Graph API インスタンスをロード（Stage3 実装予定）
+
+    環境変数:
+        INSTAGRAM_APP_ID: Instagram アプリケーション ID（Facebook App ID と同じ）
+        INSTAGRAM_APP_SECRET: Instagram アプリケーション Secret（Facebook App Secret と同じ）
+        INSTAGRAM_ACCESS_TOKEN: Instagram Graph API アクセストークン（オプション）
+        INSTAGRAM_BUSINESS_ACCOUNT_ID: Instagram ビジネスアカウント ID
+
+    Returns:
+        Instagram API クライアントインスタンスまたは None
+
+    Raises:
+        NotImplementedError: Stage3 で実装予定
+
+    参考:
+        https://developers.facebook.com/docs/instagram-api/
+    """
+    logger.warning("Instagram API は Stage3 で実装予定です")
+    # Stage3 実装例:
+    # try:
+    #     app_id = os.environ.get("INSTAGRAM_APP_ID")
+    #     app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+    #     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")  # オプション: サーバー間認証で生成も可
+    #     business_account_id = os.environ.get("INSTAGRAM_BUSINESS_ACCOUNT_ID")
+    #
+    #     if not app_id or not app_secret or not business_account_id:
+    #         logger.info("INSTAGRAM_APP_ID, APP_SECRET, BUSINESS_ACCOUNT_ID のいずれかが設定されていません（オプション）")
+    #         return None
+    #
+    #     from utils.instagram_api import InstagramAPIClient
+    #     return InstagramAPIClient(
+    #         app_id=app_id,
+    #         app_secret=app_secret,
+    #         access_token=access_token,
+    #         business_account_id=business_account_id
+    #     )
+    # except Exception as e:
+    #     logger.warning(f"Instagram API初期化エラー(続行可能): {str(e)}")
+    #     return None
+    return None
+
+
+def load_linkedin_api_from_env() -> Optional[Any]:
+    """
+    環境変数から LinkedIn Marketing API インスタンスをロード（Stage3 実装予定）
+
+    環境変数:
+        LINKEDIN_CLIENT_ID: LinkedIn アプリケーション Client ID
+        LINKEDIN_CLIENT_SECRET: LinkedIn アプリケーション Client Secret
+        LINKEDIN_ACCESS_TOKEN: LinkedIn OAuth 2.0 アクセストークン（オプション）
+
+    Returns:
+        LinkedIn API クライアントインスタンスまたは None
+
+    Raises:
+        NotImplementedError: Stage3 で実装予定
+
+    参考:
+        https://learn.microsoft.com/linkedin/marketing/
+    """
+    logger.warning("LinkedIn API は Stage3 で実装予定です")
+    # Stage3 実装例:
+    # try:
+    #     client_id = os.environ.get("LINKEDIN_CLIENT_ID")
+    #     client_secret = os.environ.get("LINKEDIN_CLIENT_SECRET")
+    #     access_token = os.environ.get("LINKEDIN_ACCESS_TOKEN")  # オプション: OAuth フローで生成も可
+    #
+    #     if not client_id or not client_secret:
+    #         logger.info("LINKEDIN_CLIENT_ID または LINKEDIN_CLIENT_SECRET が設定されていません（オプション）")
+    #         return None
+    #
+    #     from utils.linkedin_api import LinkedInAPIClient
+    #     return LinkedInAPIClient(client_id=client_id, client_secret=client_secret, access_token=access_token)
+    # except Exception as e:
+    #     logger.warning(f"LinkedIn API初期化エラー(続行可能): {str(e)}")
+    #     return None
+    return None
+
+
+def load_tiktok_api_from_env() -> Optional[Any]:
+    """
+    環境変数から TikTok Research API インスタンスをロード（Stage3 実装予定）
+
+    環境変数:
+        TIKTOK_APP_ID: TikTok アプリケーション ID（Client Key）
+        TIKTOK_APP_SECRET: TikTok アプリケーション Secret（Client Secret）
+        TIKTOK_ACCESS_TOKEN: TikTok アクセストークン（オプション）
+
+    Returns:
+        TikTok API クライアントインスタンスまたは None
+
+    Raises:
+        NotImplementedError: Stage3 で実装予定
+
+    参考:
+        https://developers.tiktok.com/
+    """
+    logger.warning("TikTok API は Stage3 で実装予定です")
+    # Stage3 実装例:
+    # try:
+    #     app_id = os.environ.get("TIKTOK_APP_ID")
+    #     app_secret = os.environ.get("TIKTOK_APP_SECRET")
+    #     access_token = os.environ.get("TIKTOK_ACCESS_TOKEN")  # オプション: OAuth フローで生成も可
+    #
+    #     if not app_id or not app_secret:
+    #         logger.info("TIKTOK_APP_ID または TIKTOK_APP_SECRET が設定されていません（オプション）")
+    #         return None
+    #
+    #     from utils.tiktok_api import TikTokAPIClient
+    #     return TikTokAPIClient(app_id=app_id, app_secret=app_secret, access_token=access_token)
+    # except Exception as e:
+    #     logger.warning(f"TikTok API初期化エラー(続行可能): {str(e)}")
+    #     return None
+    return None

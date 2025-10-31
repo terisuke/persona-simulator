@@ -5,11 +5,51 @@ X API v2連携モジュール
 
 import requests
 import logging
+import json
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from .error_handler import ErrorHandler, PerformanceLogger, APIConnectionError
 
 logger = logging.getLogger(__name__)
+
+
+def log_structured_api_call(
+    source: str,
+    account: str = None,
+    rate_limit_remaining: Optional[int] = None,
+    reset_at: Optional[str] = None,
+    generated_flag: bool = False,
+    **kwargs
+):
+    """
+    構造化ログを出力
+    
+    Args:
+        source: データソース（twitter/web_search/generated）
+        account: アカウント名
+        rate_limit_remaining: レートリミット残り回数
+        reset_at: リセット時刻（ISO形式文字列）
+        generated_flag: 生成データフラグ
+        **kwargs: その他のメタデータ
+    """
+    log_data = {
+        "source": source,
+        "generated_flag": generated_flag,
+    }
+    
+    if account:
+        log_data["account"] = account
+    
+    if rate_limit_remaining is not None:
+        log_data["rate_limit_remaining"] = rate_limit_remaining
+    
+    if reset_at:
+        log_data["reset_at"] = reset_at
+    
+    if kwargs:
+        log_data.update(kwargs)
+    
+    logger.info(f"[STRUCTURED] {json.dumps(log_data, ensure_ascii=False)}")
 
 
 class XAPIClient:
@@ -28,12 +68,19 @@ class XAPIClient:
             "Content-Type": "application/json"
         }
 
-    def _wait_for_rate_limit_reset(self, response_headers: Dict[str, str]) -> bool:
+    def _wait_for_rate_limit_reset(
+        self,
+        response_headers: Dict[str, str],
+        max_wait_seconds: int,
+        attempt: int = 0
+    ) -> bool:
         """
-        レートリミットリセットまで待機
+        レートリミットリセットまで待機（指数バックオフ+フルジッター）
         
         Args:
             response_headers: 429レスポンスのヘッダー
+            max_wait_seconds: 最大待機秒数
+            attempt: リトライ試行回数（指数バックオフ用）
             
         Returns:
             待機を実行した場合True、ヘッダーが無効な場合False
@@ -44,28 +91,53 @@ class XAPIClient:
         
         try:
             import time
+            import random
             from datetime import datetime
             
             reset_timestamp = int(response_headers['x-rate-limit-reset'])
             reset_time = datetime.fromtimestamp(reset_timestamp)
             now = datetime.now()
-            wait_seconds = (reset_time - now).total_seconds()
+            base_wait_seconds = (reset_time - now).total_seconds()
             
-            if wait_seconds <= 0:
+            if base_wait_seconds <= 0:
                 logger.info("レートリミットは既にリセット済みです")
                 return True
             
-            # 最大15分（900秒）まで待機
-            if wait_seconds > 900:
-                logger.warning(f"待機時間が長すぎます（{int(wait_seconds)}秒）。15分に制限します")
-                wait_seconds = 900
+            if max_wait_seconds <= 0:
+                logger.warning("max_wait_seconds=0のため待機せず終了します")
+                return False
+            
+            # 指数バックオフ+フルジッター（AWS推奨パターン）
+            # ベースは retry-after を優先、試行回数に応じて指数増加
+            exponential_backoff = min(2 ** attempt, 60)  # 最大60秒
+            jitter = random.uniform(0, 0.3) * exponential_backoff  # 最大30%のジッター
+            wait_seconds = base_wait_seconds + exponential_backoff + jitter
+            
+            if wait_seconds > max_wait_seconds:
+                logger.warning(
+                    f"待機時間が長すぎます（{int(wait_seconds)}秒）。"
+                    f"{max_wait_seconds}秒を超えるため待機せず終了します"
+                )
+                return False
+            
+            # 構造化ログ出力
+            log_structured_api_call(
+                source="twitter",
+                rate_limit_remaining=0,
+                reset_at=reset_time.isoformat(),
+                wait_seconds=int(wait_seconds),
+                attempt=attempt,
+                exponential_backoff=exponential_backoff,
+                jitter=jitter
+            )
             
             logger.warning(
                 f"⏳ X APIレートリミット到達。リセットまで {int(wait_seconds)}秒（約{int(wait_seconds/60)}分）待機します..."
+                f" [試行{attempt+1}回目, 指数バックオフ: {exponential_backoff:.1f}秒]"
             )
             logger.info(f"リセット時刻: {reset_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
-            time.sleep(wait_seconds + 5)  # 余裕を持って5秒追加
+            time.sleep(wait_seconds)
             logger.info("✅ レートリミット待機完了。リトライします")
             return True
             
@@ -76,7 +148,8 @@ class XAPIClient:
     def fetch_user_tweets(
         self, 
         username: str, 
-        max_results: int = 20
+        max_results: int = 20,
+        max_wait_seconds: int = 900
     ) -> List[Dict]:
         """
         指定されたユーザーの最近のツイートを取得
@@ -104,7 +177,7 @@ class XAPIClient:
                 
                 params = {
                     "max_results": min(max_results, 100),  # API制限: 5-100
-                    "tweet.fields": "created_at,text,id",
+                    "tweet.fields": "created_at,text,id,public_metrics",
                     "exclude": "retweets,replies"  # RTと返信を除外
                 }
                 
@@ -117,37 +190,79 @@ class XAPIClient:
                         timeout=15
                     )
                     
+                    # レートリミット情報を取得
+                    rate_limit_remaining = response.headers.get('x-rate-limit-remaining')
+                    rate_limit_reset = response.headers.get('x-rate-limit-reset')
+                    reset_at = None
+                    if rate_limit_reset:
+                        try:
+                            reset_timestamp = int(rate_limit_reset)
+                            reset_at = datetime.fromtimestamp(reset_timestamp).isoformat()
+                        except:
+                            pass
+                    
                     if response.status_code == 200:
                         data = response.json()
                         tweets = []
                         
                         if "data" in data:
                             for tweet in data["data"]:
-                                tweets.append({
+                                tweet_dict = {
                                     "id": tweet.get("id", ""),
                                     "text": tweet.get("text", ""),
                                     "link": f"https://x.com/{username}/status/{tweet.get('id', '')}",
                                     "date": tweet.get("created_at", "")
-                                })
+                                }
+                                # public_metricsが含まれている場合は追加
+                                if "public_metrics" in tweet:
+                                    tweet_dict["public_metrics"] = tweet.get("public_metrics", {})
+                                tweets.append(tweet_dict)
+                        
+                        # 構造化ログ出力
+                        log_structured_api_call(
+                            source="twitter",
+                            account=username,
+                            rate_limit_remaining=int(rate_limit_remaining) if rate_limit_remaining else None,
+                            reset_at=reset_at,
+                            generated_flag=False,
+                            tweet_count=len(tweets),
+                            attempt=attempt
+                        )
                         
                         logger.info(f"取得完了: {len(tweets)}件のツイート")
                         return tweets
                     
                     elif response.status_code == 429:
+                        # 429エラーの場合、例外に429属性を付与
+                        error = APIConnectionError("⚠️ X APIレートリミットに達しました。時間をおいて再試行してください。")
+                        error.status_code = 429
+                        error.response_headers = response.headers
+                        
+                        # 構造化ログ出力（429エラー）
+                        log_structured_api_call(
+                            source="twitter",
+                            account=username,
+                            rate_limit_remaining=0,
+                            reset_at=reset_at,
+                            generated_flag=False,
+                            status_code=429,
+                            attempt=attempt
+                        )
+                        
                         if attempt == 0:
-                            # 初回の429エラー: リセットまで待機してリトライ
+                            # 初回の429エラー: リセットまで待機してリトライ（CLIのみ、UIでは即座に例外）
                             logger.warning("X APIレートリミットに達しました")
-                            if self._wait_for_rate_limit_reset(response.headers):
+                            if max_wait_seconds > 0 and self._wait_for_rate_limit_reset(response.headers, max_wait_seconds, attempt=attempt):
                                 logger.info("リトライします（2回目の試行）")
                                 continue  # リトライ
                             else:
-                                # ヘッダーが無効な場合は例外を投げる
-                                logger.error("レートリミット情報が取得できませんでした")
-                                raise APIConnectionError("⚠️ X APIレートリミットに達しました。時間をおいて再試行してください。")
+                                # ヘッダーが無効な場合、またはUI（max_wait_seconds=0）の場合は例外を投げる
+                                logger.error("レートリミット情報が取得できませんでした、または待機が許可されていません")
+                                raise error
                         else:
                             # 2回目も429: 諦めて例外を投げる
                             logger.error("リトライ後もレートリミットエラーが継続しています")
-                            raise APIConnectionError("⚠️ X APIレートリミットに達しました。時間をおいて再試行してください。")
+                            raise error
                     
                     elif response.status_code == 401:
                         logger.error("X API認証エラー")
@@ -169,6 +284,143 @@ class XAPIClient:
         except Exception as e:
             ErrorHandler.log_error(e, f"X API投稿取得: @{username}")
             raise APIConnectionError(f"X API取得エラー: {str(e)}")
+    
+    def fetch_user_by_handle(
+        self,
+        handles: List[str],
+        fields: List[str] = None
+    ) -> List[Dict]:
+        """
+        複数のユーザーハンドルからユーザー情報を取得
+        
+        Args:
+            handles: ユーザーハンドルリスト（@なし）
+            fields: 取得するフィールド（デフォルト: ["public_metrics", "created_at", "verified"]）
+            
+        Returns:
+            ユーザー情報リスト [{"id": str, "username": str, "public_metrics": {...}, ...}]
+        """
+        if fields is None:
+            fields = ["public_metrics", "created_at", "verified"]
+        
+        # @を削除
+        handles_clean = [h.lstrip("@") for h in handles]
+        
+        # X API v2 の users/by エンドポイントは最大100ユーザーまで
+        if len(handles_clean) > 100:
+            logger.warning(f"ハンドル数が100を超えています。最初の100件のみ取得します")
+            handles_clean = handles_clean[:100]
+        
+        endpoint = f"{self.BASE_URL}/users/by"
+        
+        params = {
+            "usernames": ",".join(handles_clean),
+            "user.fields": ",".join(fields)
+        }
+        
+        try:
+            response = requests.get(
+                endpoint,
+                headers=self.headers,
+                params=params,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                users = []
+                
+                if "data" in data:
+                    for user in data["data"]:
+                        users.append({
+                            "id": user.get("id"),
+                            "username": user.get("username"),
+                            "name": user.get("name"),
+                            "verified": user.get("verified", False),
+                            "created_at": user.get("created_at"),
+                            "public_metrics": user.get("public_metrics", {}),
+                            "description": user.get("description", "")
+                        })
+                    
+                    logger.info(f"ユーザー情報取得完了: {len(users)}件")
+                    return users
+                else:
+                    logger.warning("ユーザー情報が取得できませんでした")
+                    return []
+            
+            elif response.status_code == 429:
+                # 429エラーの場合、例外に429属性を付与
+                error = APIConnectionError("⚠️ X APIレートリミットに達しました。")
+                error.status_code = 429
+                error.response_headers = response.headers
+                raise error
+            
+            else:
+                logger.error(f"ユーザー情報取得失敗: {response.status_code} - {response.text}")
+                return []
+        
+        except APIConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"ユーザー情報取得エラー: {str(e)}")
+            return []
+    
+    def fetch_user_metrics(
+        self,
+        handle: str
+    ) -> Optional[Dict]:
+        """
+        ユーザーのメトリクスを取得（followers_count, tweet_count, last_tweet_at）
+        
+        Args:
+            handle: ユーザーハンドル（@なし）
+            
+        Returns:
+            メトリクス辞書 {
+                "followers_count": int,
+                "tweet_count": int,
+                "last_tweet_at": Optional[str]  # ISO形式の日時文字列
+            } または None（取得失敗時）
+        """
+        handle_clean = handle.lstrip("@")
+        
+        try:
+            # ユーザー情報を取得
+            users = self.fetch_user_by_handle([handle_clean], fields=["public_metrics", "created_at"])
+            
+            if not users or len(users) == 0:
+                logger.warning(f"ユーザー情報が取得できませんでした: @{handle_clean}")
+                return None
+            
+            user = users[0]
+            metrics = user.get("public_metrics", {})
+            
+            # 最新のツイートを1件取得してlast_tweet_atを取得
+            last_tweet_at = None
+            tweets = self.fetch_user_tweets(handle_clean, max_results=1, max_wait_seconds=0)
+            if tweets and len(tweets) > 0:
+                last_tweet_at = tweets[0].get("date")
+            
+            result = {
+                "followers_count": metrics.get("followers_count", 0),
+                "tweet_count": metrics.get("tweet_count", 0),
+                "following_count": metrics.get("following_count", 0),
+                "listed_count": metrics.get("listed_count", 0),
+                "last_tweet_at": last_tweet_at,
+                "account_created_at": user.get("created_at")
+            }
+            
+            logger.info(
+                f"メトリクス取得完了: @{handle_clean} - "
+                f"フォロワー: {result['followers_count']}, "
+                f"ツイート: {result['tweet_count']}"
+            )
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"メトリクス取得エラー: @{handle_clean} - {str(e)}")
+            return None
     
     def _get_user_id(self, username: str) -> Optional[str]:
         """
@@ -206,7 +458,8 @@ class XAPIClient:
     def search_recent_tweets(
         self,
         query: str,
-        max_results: int = 20
+        max_results: int = 20,
+        max_wait_seconds: int = 900
     ) -> List[Dict]:
         """
         検索クエリで最近のツイートを検索
@@ -238,6 +491,17 @@ class XAPIClient:
                     timeout=15
                 )
                 
+                # レートリミット情報を取得
+                rate_limit_remaining = response.headers.get('x-rate-limit-remaining')
+                rate_limit_reset = response.headers.get('x-rate-limit-reset')
+                reset_at = None
+                if rate_limit_reset:
+                    try:
+                        reset_timestamp = int(rate_limit_reset)
+                        reset_at = datetime.fromtimestamp(reset_timestamp).isoformat()
+                    except:
+                        pass
+                
                 if response.status_code == 200:
                     data = response.json()
                     tweets = []
@@ -251,19 +515,43 @@ class XAPIClient:
                                 "date": tweet.get("created_at", "")
                             })
                     
+                    # 構造化ログ出力
+                    log_structured_api_call(
+                        source="twitter",
+                        account=None,
+                        rate_limit_remaining=int(rate_limit_remaining) if rate_limit_remaining else None,
+                        reset_at=reset_at,
+                        generated_flag=False,
+                        query=query,
+                        tweet_count=len(tweets),
+                        attempt=attempt
+                    )
+                    
                     logger.info(f"検索完了: {len(tweets)}件")
                     return tweets
                 
                 elif response.status_code == 429:
+                    # 構造化ログ出力（429エラー）
+                    log_structured_api_call(
+                        source="twitter",
+                        account=None,
+                        rate_limit_remaining=0,
+                        reset_at=reset_at,
+                        generated_flag=False,
+                        query=query,
+                        status_code=429,
+                        attempt=attempt
+                    )
+                    
                     if attempt == 0:
-                        # 初回の429エラー: リセットまで待機してリトライ
+                        # 初回の429エラー: リセットまで待機してリトライ（CLIのみ、UIでは即座に例外）
                         logger.warning("X API検索でレートリミットに達しました")
-                        if self._wait_for_rate_limit_reset(response.headers):
+                        if max_wait_seconds > 0 and self._wait_for_rate_limit_reset(response.headers, max_wait_seconds, attempt=attempt):
                             logger.info("検索をリトライします（2回目の試行）")
                             continue  # リトライ
                         else:
-                            # ヘッダーが無効な場合は空リストを返す
-                            logger.error("レートリミット情報が取得できませんでした")
+                            # ヘッダーが無効な場合、またはUI（max_wait_seconds=0）の場合は空リストを返す
+                            logger.error("レートリミット情報が取得できませんでした、または待機が許可されていません")
                             return []
                     else:
                         # 2回目も429: 空リストを返す
@@ -280,4 +568,3 @@ class XAPIClient:
         except Exception as e:
             logger.error(f"検索エラー: {str(e)}")
             return []
-

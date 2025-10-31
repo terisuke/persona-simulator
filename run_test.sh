@@ -196,6 +196,62 @@ else
 fi
 echo ""
 
+# ステップ7.5: データソース統計の確認
+echo "📊 ステップ7.5: データソース統計の確認"
+echo "--------------------------------------------------"
+
+print_info "ログファイルからデータソース統計を抽出中..."
+python << 'EOF'
+import re
+
+try:
+    with open('.cache/ingest.log', 'r', encoding='utf-8') as f:
+        log_content = f.read()
+
+    # データソース統計を抽出
+    twitter_match = re.search(r'🔑 X API \(Twitter\):\s*(\d+)', log_content)
+    web_search_match = re.search(r'🌐 Grok Web Search:\s*(\d+)', log_content)
+    generated_match = re.search(r'📝 フォールバック生成:\s*(\d+)', log_content)
+    real_data_ratio_match = re.search(r'💡 実データ比率:\s*([\d.]+)%', log_content)
+
+    if twitter_match or web_search_match or generated_match:
+        print("\n📊 データソース内訳:")
+        if twitter_match:
+            print(f"  🔑 X API (Twitter): {twitter_match.group(1)} 件")
+        if web_search_match:
+            print(f"  🌐 Grok Web Search: {web_search_match.group(1)} 件")
+        if generated_match:
+            print(f"  📝 フォールバック生成: {generated_match.group(1)} 件")
+
+        if real_data_ratio_match:
+            ratio = float(real_data_ratio_match.group(1))
+            print(f"\n  💡 実データ比率: {ratio:.1f}%")
+
+            # 実データ比率の評価
+            if ratio >= 80:
+                print("  ✅ 実データ比率が高く、質の高いペルソナ生成が期待できます")
+            elif ratio >= 50:
+                print("  ⚠️  実データ比率は中程度です。必要に応じて X API 設定を確認してください")
+            else:
+                print("  ⚠️  実データ比率が低いです。X_BEARER_TOKEN の設定を確認してください")
+
+        exit(0)
+    else:
+        print("❌ ソース統計が見つかりませんでした")
+        exit(1)
+except Exception as e:
+    print(f"❌ エラー: {e}")
+    exit(1)
+EOF
+
+if [ $? -eq 0 ]; then
+    print_success "データソース統計を確認しました"
+else
+    print_error "データソース統計の確認に失敗しました"
+    exit 1
+fi
+echo ""
+
 # ステップ8: 部分的なキャッシュ状態を作成（Stage2用）
 echo "🔧 ステップ8: Stage2 テスト準備"
 echo "--------------------------------------------------"

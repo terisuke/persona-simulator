@@ -34,5 +34,43 @@ Store API credentials in `.streamlit/secrets.toml` using the keys referenced in 
 - サイドバーの一括アップロード、バッチ処理トリガー、エラー一覧などのUI仕様は `README.md` の「一括管理モード」と `TEST_PROCEDURE.md` に記載しています。
 - バッチ処理後は `st.session_state['account_status']` を必ず更新し、進捗メトリクスとエラー一覧（サイドバー下部）が一致するようにしてください。
 - CLI のキャッシュを尊重するため、初回ロード時は `.cache/posts_{account}.pkl` を必ず参照し、不要な API コールを避ける実装を維持します。
+- UI 上での X API リトライは最大待機時間を 0 秒に設定し（`UI_MAX_RATE_WAIT_SECONDS`）、レート制限に達した際は速やかに警告表示へ切り替えます。実データ取得は Stage1 のバッチに委ねる運用を徹底してください。
 
 両ステージとも、機能追加時は `AGENTS.md` → `README.md` → `TEST_PROCEDURE.md` の順にドキュメントを更新し、`run_test.sh` で統合確認する運用を徹底してください。
+
+### ペルソナ状態遷移とデータソース管理
+
+**ペルソナ状態**:
+- `unverified`（未確定）: データ不足または解析失敗によりペルソナ生成に失敗
+  - 議論参加不可
+  - UI で「データ不足」表示、CLI実行を促すCTA表示
+  - CLI での再取得により `verified` へ移行可能
+- `verified`（確定済み）: 正常にペルソナ生成が完了
+  - 議論参加可能
+  - `quality_score` が付与されている場合、品質評価も完了
+
+**データソース**:
+- `twitter`: X API v2 経由で取得（実データ）
+- `web_search`: Grok Web Search 経由で取得（実データ）
+- `generated`: フォールバック生成（運用モードでは禁止）
+- `unknown`: 不明（キャッシュからの読み込み時など）
+
+**X API オプトアウト時のワークフロー**:
+- UI側で「X APIを使用する」トグルをOFF、またはCLIで`--no-x-api`指定時
+  - X APIクライアントは`None`として扱われ、X API経由の取得はスキップされる
+  - Grok Web Searchのみで投稿を取得（実データ）
+  - `quality_score`は信頼度ベースの暫定評価となり、`quality_reasons`に「X API metrics unavailable – fallback evaluation」が追加される
+  - UIのKPIカードで「X APIが無効化されているため、quality_scoreは暫定値です」という警告が表示される
+  - CLIログには「X API使用: False」が記録され、サマリにも反映される
+  - レート制限を気にせずに大量候補を収集したい場合に有効（「100人の村」構築フェーズ）
+
+**品質スコア（quality_score）**:
+- 実世界指標ベース（0.0-1.0）
+- 計算式: `0.5 * followers_norm + 0.3 * recency_norm + 0.2 * postcount_norm`
+- 0.6未満は品質基準未満として除外推奨
+- X API メトリクスが取得できない場合は信頼度ベースの暫定評価
+- X API無効時（トグルOFFまたは`--no-x-api`）は常に暫定評価となり、`quality_reasons`に明確な理由が記録される
+
+### Open TODO（将来対応）
+
+- UI サイドバーに TextBlob センチメントによるフィルタを追加

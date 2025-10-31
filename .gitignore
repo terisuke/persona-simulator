@@ -54,3 +54,7 @@ Thumbs.db
 test_accounts*.txt
 test_statistics.txt
 test_429_*
+test_source_stats.txt
+test_final_stats.txt
+sample_accounts*.csv
+sample_accounts*.txt

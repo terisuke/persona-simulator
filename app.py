@@ -10,6 +10,9 @@ import pickle
 import os
 import pandas as pd
 import io
+import subprocess
+import glob
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -19,6 +22,7 @@ DEFAULT_POST_LIMIT = 20
 TOP_K_RELEVANT_POSTS = 3
 RECENT_CONTEXT_MESSAGES = 3
 BATCH_SIZE = 10  # バッチ処理のサイズ
+UI_MAX_RATE_WAIT_SECONDS = 0  # UIではレート制限待ちを実施しない
 
 # 自作モジュール
 from utils.grok_api import GrokAPI
@@ -26,6 +30,7 @@ from utils.x_api import XAPIClient
 from utils.persona import PersonaManager
 from utils.similarity import SimilaritySearcher
 from utils.debate_ui import DebateUI
+from utils.error_handler import APIConnectionError
 
 # ロギング設定
 logging.basicConfig(
@@ -67,8 +72,20 @@ def load_grok_api() -> Optional[GrokAPI]:
         return None
 
 
-def load_x_api() -> Optional[XAPIClient]:
-    """X API v2インスタンスをロード（オプション）"""
+def load_x_api(use_x_api: bool = True) -> Optional[XAPIClient]:
+    """
+    X API v2インスタンスをロード（オプション）
+    
+    Args:
+        use_x_api: X APIを使用するかどうか（Falseの場合は常にNoneを返す）
+    
+    Returns:
+        XAPIClient インスタンスまたは None
+    """
+    if not use_x_api:
+        logger.info("X APIを使用しない設定のためスキップ")
+        return None
+    
     try:
         bearer_token = st.secrets.get("X_BEARER_TOKEN")
         if not bearer_token or bearer_token == "your_x_bearer_token_here":
@@ -220,6 +237,20 @@ def initialize_session_state():
     if 'batch_processed_count' not in st.session_state:
         st.session_state['batch_processed_count'] = 0
 
+    if 'discovery_in_progress' not in st.session_state:
+        st.session_state['discovery_in_progress'] = False
+
+    if 'discovered_source' not in st.session_state:
+        st.session_state['discovered_source'] = {}
+    
+    # X API使用可否の初期化（X_BEARER_TOKENが設定されていればTrue、なければFalse）
+    if 'use_x_api' not in st.session_state:
+        try:
+            bearer_token = st.secrets.get("X_BEARER_TOKEN")
+            st.session_state['use_x_api'] = bool(bearer_token and bearer_token != "your_x_bearer_token_here")
+        except:
+            st.session_state['use_x_api'] = False
+
 
 def restore_session_from_cache():
     """キャッシュからセッション状態を復元"""
@@ -311,12 +342,28 @@ def fetch_and_analyze_posts(
     
     # 投稿取得
     with st.spinner(f"📡 @{account}の投稿を取得中..."):
-        posts = grok_api.fetch_posts(
-            account, 
-            limit=DEFAULT_POST_LIMIT, 
-            since_date="2024-01-01",
-            x_api_client=x_api
-        )
+        try:
+            # 運用モードでは生成フォールバックを許可しない
+            mode_val = st.secrets.get("MODE", "dev")
+            is_operational_mode = str(mode_val).lower() in {"prod", "staging"}
+
+            posts = grok_api.fetch_posts(
+                account, 
+                limit=DEFAULT_POST_LIMIT, 
+                since_date="2024-01-01",
+                x_api_client=x_api,
+                max_rate_wait_seconds=UI_MAX_RATE_WAIT_SECONDS if x_api else 900,
+                allow_generated=False if is_operational_mode else True
+            )
+        except APIConnectionError as err:
+            st.warning(
+                f"⚠️ @{account} の投稿取得がレート制限のため中断されました。\n"
+                "👉 バッチ生成(ingest_accounts.py)を再実行し、15分後に再試行ください。\n"
+                "詳しくは README の『一括管理モード』を参照してください。"
+            )
+            logger.warning(f"UIレート制限: @{account} - {err}")
+            st.session_state.setdefault('account_status', {})[account_clean] = 'error'
+            return [], {}
     
     if not posts:
         st.warning(f"⚠️ @{account}の投稿が取得できませんでした")
@@ -325,12 +372,16 @@ def fetch_and_analyze_posts(
         return [], {}
     
     # 取得方法を判定して表示
+    source = "unknown"
     if posts[0]['id'].startswith('web_search_'):
         st.success(f"✅ {len(posts)}件の実投稿を取得（🌐 Grok Web Search）")
+        source = "web_search"
     elif posts[0]['id'].startswith('sample_') or posts[0]['id'].startswith('generated_'):
         st.info(f"📝 {len(posts)}件のサンプル投稿を生成（⚠️ フォールバック）")
+        source = "generated"
     else:
         st.success(f"✅ {len(posts)}件の実投稿を取得（🔑 X API v2）")
+        source = "twitter"
     
     # ペルソナ生成（マルチプラットフォーム対応）
     with st.spinner(f"🧠 @{account}のペルソナを生成中..."):
@@ -349,12 +400,19 @@ def fetch_and_analyze_posts(
     if persona_profile:
         enrichment_note = "（マルチプラットフォーム分析）" if enable_web else ""
         st.success(f"✅ ペルソナ生成完了{enrichment_note}: {persona_profile.get('name', account)}")
+    else:
+        st.warning(
+            "⚠️ ペルソナは未確定です（実データ不足または解析失敗）。\n"
+            "👉 まずは CLI のバッチ取得で実投稿のキャッシュ生成を行ってください。"
+        )
+        st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
     
     # データを保存
     data = {
         'posts': posts,
-        'persona': persona_profile,
-        'fetched_at': datetime.now().isoformat()
+        'persona': persona_profile or {},
+        'fetched_at': datetime.now().isoformat(),
+        'source': source
     }
     
     # ファイルキャッシュ保存
@@ -362,8 +420,10 @@ def fetch_and_analyze_posts(
     
     # セッション状態にも保存（自動再実行時に再取得を防ぐ）
     st.session_state[session_key] = data
-    # 成功ステータスを反映
-    st.session_state.setdefault('account_status', {})[account_clean] = 'cached_session'
+    # ステータスを反映（未確定の場合は unverified）
+    st.session_state.setdefault('account_status', {})[account_clean] = (
+        'cached_session' if persona_profile else 'unverified'
+    )
     
     return posts, persona_profile
 
@@ -470,11 +530,15 @@ def main():
         st.success("✅ Grok API接続OK")
         
         # X API v2チェック（オプション）
-        x_api = load_x_api()
+        # 注意: トグルは後で表示されるが、ここではセッション状態を参照
+        use_x_api_flag = st.session_state.get('use_x_api', True)
+        x_api = load_x_api(use_x_api=use_x_api_flag)
         if x_api:
             st.success("✅ X API v2接続OK（実投稿取得）")
+        elif use_x_api_flag:
+            st.info("ℹ️ X API未設定（Grok Web Searchを使用）")
         else:
-            st.info("ℹ️ X API未設定（サンプル投稿生成）")
+            st.info("ℹ️ X APIは無効化されています（Grok Web Searchを使用）")
         
         # アカウント管理（一括アップロード対応）
         st.subheader("📝 Xアカウント管理")
@@ -603,7 +667,8 @@ def main():
                 value="",
                 key="new_account_input",
                 placeholder="例: elonmusk（@なしで入力）",
-                help="アカウント名を完全に入力してから追加ボタンをクリック"
+                help="アカウント名を完全に入力してから追加ボタンをクリック",
+                autocomplete="off"
             )
             
             col1, col2 = st.columns([3, 1])
@@ -668,6 +733,175 @@ def main():
         
         st.divider()
         
+        # データソースフィルタ（Stage3準備）
+        st.subheader("🌐 データソースフィルタ")
+        source_filter = st.multiselect(
+            "表示するデータソース",
+            options=["全て", "Twitter", "Web", "Sample", "Keyword", "Random"],
+            default=["全て"],
+            help="データ取得元でフィルタ（Twitter=🔑 X API, Web=🌐 Grok 検索, Sample=📝 フォールバック）"
+        )
+        st.session_state["source_filter"] = source_filter
+        
+        # 収集（Stage2.5）
+        st.subheader("🔍 キーワードで収集")
+        discover_keyword = st.text_input(
+            "キーワード",
+            value="AI engineer",
+            help="例: AI engineer, LLM researcher, startup founder など",
+            autocomplete="off"
+        )
+        max_results = st.slider(
+            "最大人数",
+            min_value=1,
+            max_value=100,
+            value=50
+        )
+        col_dk1, col_dk2 = st.columns([2, 1])
+        with col_dk1:
+            if st.button("🚀 収集開始", use_container_width=True):
+                st.session_state['discovery_in_progress'] = True
+                st.rerun()
+        with col_dk2:
+            dry_run = st.toggle("ドライラン", value=False, help="Grok未設定でも固定ダミーデータで動作確認")
+
+        st.caption("🎲 ランダム収集（プリセットクエリ）")
+        if st.button("🎲 ランダム収集を開始", use_container_width=True):
+            st.session_state['discovery_in_progress'] = True
+            st.session_state['discovery_random'] = True
+            st.rerun()
+
+        # 収集中の処理
+        if st.session_state.get('discovery_in_progress', False):
+            st.info("🔄 候補アカウントを収集中… 少しお待ちください")
+            try:
+                discover_dir = Path(".cache/discover_results")
+                discover_dir.mkdir(parents=True, exist_ok=True)
+
+                if st.session_state.get('discovery_random', False):
+                    cmd = [
+                        "python", "ingest_accounts.py", "--discover-random",
+                        "--max-results", str(max_results)
+                    ]
+                    if dry_run:
+                        cmd.append("--dry-run")
+                    if not st.session_state.get('use_x_api', True):
+                        cmd.append("--no-x-api")
+                    subprocess.run(cmd, check=True)
+                    pattern_csv = str(discover_dir / "random_accounts_*.csv")
+                    pattern_txt = str(discover_dir / "random_accounts_*.txt")
+                    discovered_kind = "grok_random"
+                else:
+                    cmd = [
+                        "python", "ingest_accounts.py", "--discover-keyword", discover_keyword,
+                        "--max-results", str(max_results)
+                    ]
+                    if dry_run:
+                        cmd.append("--dry-run")
+                    if not st.session_state.get('use_x_api', True):
+                        cmd.append("--no-x-api")
+                    subprocess.run(cmd, check=True)
+                    pattern_csv = str(discover_dir / "keyword_*.csv")
+                    pattern_txt = str(discover_dir / "keyword_*.txt")
+                    discovered_kind = "grok_keyword"
+
+                # 最新の結果ファイルを取得
+                candidates = []
+                files = sorted(glob.glob(pattern_csv) + glob.glob(pattern_txt), key=lambda p: Path(p).stat().st_mtime, reverse=True)
+                latest = files[0] if files else None
+                if latest:
+                    if latest.endswith('.csv'):
+                        try:
+                            df = pd.read_csv(latest)
+                            # handle 列が基本、なければ username/account/name をフォールバック
+                            handle_col = None
+                            for col in df.columns:
+                                if str(col).lower() in ["handle", "username", "account", "name"]:
+                                    handle_col = col
+                                    break
+                            if handle_col is not None:
+                                candidates = [str(h).strip().lstrip('@') for h in df[handle_col].tolist() if str(h).strip()]
+                            # 発見元をセッションに記録（Stage1が未実行でもUI表示用）
+                            for h in candidates:
+                                st.session_state['discovered_source'][h] = discovered_kind
+                        except Exception as e:
+                            st.warning(f"結果CSVの読込に失敗: {e}")
+                    else:
+                        try:
+                            with open(latest, 'r', encoding='utf-8') as f:
+                                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+                                candidates = [l.lstrip('@') for l in lines]
+                            for h in candidates:
+                                st.session_state['discovered_source'][h] = discovered_kind
+                        except Exception as e:
+                            st.warning(f"結果TXTの読込に失敗: {e}")
+
+                # 既存にマージ（上限チェック）
+                if candidates:
+                    existing_list = st.session_state.get('accounts_list', [])
+                    existing = set(existing_list)
+                    new_unique = [c for c in candidates if c not in existing]
+                    if new_unique:
+                        available = max(0, MAX_ACCOUNTS - len(existing_list))
+                        if available <= 0:
+                            st.warning(f"最大 {MAX_ACCOUNTS} 件に達しています。新規追加できませんでした。")
+                            to_add = []
+                        else:
+                            to_add = new_unique[:available]
+                            dropped = max(0, len(new_unique) - available)
+                            if dropped > 0:
+                                st.warning(f"{dropped} 件は上限超過のため追加されませんでした。")
+                            st.session_state['accounts_list'].extend(to_add)
+                            # ステータス更新
+                            st.session_state['account_status'] = check_cache_status(st.session_state['accounts_list'])
+                        if to_add:
+                            st.success(f"✅ 新規 {len(to_add)} アカウントを追加しました")
+                    else:
+                        st.info("新規追加はありません（重複）")
+                    # ダウンロードとStage1送付
+                    st.download_button(
+                        label="📥 収集リストをダウンロード",
+                        data=open(latest, 'rb').read(),
+                        file_name=Path(latest).name
+                    )
+                    if st.button("📦 Stage1(ingest_accounts.py) に送る", use_container_width=True):
+                        try:
+                            cmd = ["python", "ingest_accounts.py", latest]
+                            if not st.session_state.get('use_x_api', True):
+                                cmd.append("--no-x-api")
+                            subprocess.run(cmd, check=True)
+                            st.success("Stage1 バッチを開始しました。完了後にキャッシュが反映されます。")
+                        except Exception as e:
+                            st.error(f"Stage1 実行に失敗: {e}")
+                else:
+                    st.warning("候補が見つかりませんでした")
+
+            except subprocess.CalledProcessError as e:
+                st.error(f"収集コマンドが失敗しました: {e}")
+            except Exception as e:
+                st.error(f"収集中にエラーが発生: {e}")
+            finally:
+                st.session_state['discovery_in_progress'] = False
+                st.session_state.pop('discovery_random', None)
+                st.rerun()
+
+        # X API使用トグル
+        st.subheader("🔑 X API設定")
+        use_x_api = st.toggle(
+            "X APIを使用する",
+            value=st.session_state.get('use_x_api', True),
+            help="X APIを無効化すると、Grok Web Searchのみで投稿を取得します。quality_scoreは暫定値になります。"
+        )
+        st.session_state['use_x_api'] = use_x_api
+        
+        if not use_x_api:
+            mode_val = st.secrets.get("MODE", "dev")
+            is_operational_mode = str(mode_val).lower() in {"prod", "staging"}
+            if is_operational_mode:
+                st.warning("⚠️ 運用モードでX APIを無効化しています。quality_scoreは暫定値になります。")
+            else:
+                st.info("ℹ️ X APIが無効化されています。Grok Web Searchのみで取得します。")
+
         # バッチ処理セクション
         st.subheader("⚡ バッチ処理")
         
@@ -757,6 +991,100 @@ def main():
                 st.rerun()
         else:
             st.caption("現在エラーはありません")
+        
+        # KPIカード（サイドバー下部）
+        st.markdown("---")
+        st.subheader("📊 品質KPI")
+        
+        # アカウントデータからKPIを計算
+        accounts_list = st.session_state.get('accounts_list', [])
+        if accounts_list:
+            # データソース別カウント
+            twitter_count = 0
+            web_search_count = 0
+            generated_count = 0
+            unverified_count = 0
+            quality_scores = []
+            
+            for account in accounts_list:
+                account_clean = account.lstrip('@')
+                session_key = f"session_data_{account_clean}"
+                
+                if session_key in st.session_state:
+                    data = st.session_state[session_key]
+                    source = data.get('source', 'unknown')
+                    
+                    if source == 'twitter':
+                        twitter_count += 1
+                    elif source == 'web_search':
+                        web_search_count += 1
+                    elif source == 'generated':
+                        generated_count += 1
+                    
+                    # 未確定チェック
+                    persona = data.get('persona', {})
+                    if not persona or len(persona) == 0:
+                        unverified_count += 1
+                    
+                    # quality_score集計
+                    if 'quality_score' in persona:
+                        quality_scores.append(persona['quality_score'])
+                
+                # ステータスから未確定をカウント
+                status = st.session_state.get('account_status', {}).get(account_clean, 'pending')
+                if status == 'unverified':
+                    unverified_count += 1
+            
+            total = len(accounts_list)
+            if total > 0:
+                real_count = twitter_count + web_search_count
+                real_ratio = (real_count / total) * 100
+                generated_ratio = (generated_count / total) * 100
+                
+                # 実/生成比
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("実データ比率", f"{real_ratio:.1f}%", f"{real_count}/{total}")
+                with col2:
+                    if generated_ratio > 0:
+                        st.metric("生成データ率", f"{generated_ratio:.1f}%", f"{generated_count}/{total}", delta_color="inverse")
+                    else:
+                        st.metric("生成データ率", "0%", "0/0")
+                
+                # 未確定数
+                st.metric("未確定ペルソナ", unverified_count, f"全{total}件中")
+                
+                # 平均/中央値quality_score
+                if quality_scores:
+                    avg_quality = sum(quality_scores) / len(quality_scores)
+                    median_quality = sorted(quality_scores)[len(quality_scores) // 2]
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("平均quality_score", f"{avg_quality:.2f}", f"{len(quality_scores)}件")
+                    with col2:
+                        st.metric("中央値quality_score", f"{median_quality:.2f}", "")
+                    
+                    # X API無効時の警告
+                    if not st.session_state.get('use_x_api', True):
+                        st.warning("⚠️ X APIが無効化されているため、quality_scoreは暫定値です。")
+                else:
+                    st.caption("quality_scoreデータなし")
+                    # X API無効時の警告
+                    if not st.session_state.get('use_x_api', True):
+                        st.warning("⚠️ X APIが無効化されているため、quality_scoreは暫定値になります。")
+                
+                # 運用モード警告（生成データがある場合）
+                mode_val = st.secrets.get("MODE", "dev")
+                is_operational = str(mode_val).lower() in {"prod", "staging"}
+                
+                if is_operational and generated_ratio > 0:
+                    st.error(f"⚠️ 運用モードで生成データが検出されました ({generated_ratio:.1f}%)")
+                    st.caption("実データ取得を再実行してください")
+            else:
+                st.caption("データなし")
+        else:
+            st.caption("アカウントが登録されていません")
     
     # メインエリア
     if not accounts:
@@ -936,7 +1264,8 @@ def main():
             topic = st.text_input(
                 "💬 議論トピック",
                 value=st.session_state.get('debate_topic', 'AIの倫理的課題について'),
-                placeholder="議論したいトピックを入力してください"
+                placeholder="議論したいトピックを入力してください",
+                autocomplete="off"
             )
             st.session_state['debate_topic'] = topic
         
@@ -1231,7 +1560,8 @@ def main():
                 search_term = st.text_input(
                     "アカウント名で検索",
                     placeholder="アカウント名の一部を入力",
-                    help="アカウント名の一部で検索"
+                    help="アカウント名の一部で検索",
+                    autocomplete="off"
                 )
             
             with col3:
@@ -1255,11 +1585,48 @@ def main():
                 elif status_filter == "エラー" and account_status != 'error':
                     continue
                 
+                # データソース取得（セッション優先 → ファイル）
+                sess_key = f"session_data_{account}"
+                source_val = None
+                if sess_key in st.session_state:
+                    source_val = st.session_state[sess_key].get('source')
+                if not source_val:
+                    cached_obj = load_cache(f"posts_{account}")
+                    if cached_obj:
+                        source_val = cached_obj.get('source')
+                # カテゴリマッピング
+                if source_val == 'twitter':
+                    source_cat = 'Twitter'
+                elif source_val == 'web_search':
+                    source_cat = 'Web'
+                elif source_val == 'generated':
+                    source_cat = 'Sample'
+                elif source_val == 'grok_keyword':
+                    source_cat = 'Keyword'
+                elif source_val == 'grok_random':
+                    source_cat = 'Random'
+                else:
+                    source_cat = 'Unknown'
+                
+                # ソースフィルタ（サイドバー）
+                sf = st.session_state.get('source_filter', ["全て"]) or ["全て"]
+                if "全て" not in sf:
+                    if source_cat not in sf:
+                        continue
+                
                 # 検索フィルタ
                 if search_term and search_term.lower() not in account.lower():
                     continue
                 
-                filtered_accounts.append((account, data, account_status))
+                # 未取得のアカウントは discovery 情報を補助表示
+                if source_cat == 'Unknown':
+                    disc = st.session_state.get('discovered_source', {}).get(account)
+                    if disc == 'grok_keyword':
+                        source_cat = 'Keyword'
+                    elif disc == 'grok_random':
+                        source_cat = 'Random'
+                
+                filtered_accounts.append((account, data, account_status, source_cat))
             
             # ソート
             if sort_option == "アカウント名":
@@ -1275,7 +1642,7 @@ def main():
             if filtered_accounts:
                 # データフレーム形式で表示
                 display_data = []
-                for account, data, status in filtered_accounts:
+                for account, data, status, source_cat in filtered_accounts:
                     posts = data.get('posts', [])
                     persona = data.get('persona', {})
                     
@@ -1286,6 +1653,20 @@ def main():
                         'pending': '⏳ 待機中',
                         'error': '❌ エラー'
                     }.get(status, '❓ 不明')
+                    
+                    # ソースバッジ
+                    if source_cat == 'Twitter':
+                        source_display = '✅ Twitter'
+                    elif source_cat == 'Web':
+                        source_display = '🌐 Web'
+                    elif source_cat == 'Sample':
+                        source_display = '📝 Sample'
+                    elif source_cat == 'Keyword':
+                        source_display = '🔍 Keyword'
+                    elif source_cat == 'Random':
+                        source_display = '🎲 Random'
+                    else:
+                        source_display = '❓ Unknown'
                     
                     # キャッシュ日時を取得
                     cache_time = "不明"
@@ -1309,6 +1690,7 @@ def main():
                     display_data.append({
                         "アカウント": f"@{account}",
                         "ステータス": status_display,
+                        "データソース": source_display,
                         "投稿数": len(posts),
                         "ペルソナ名": persona.get('name', account),
                         "キャッシュ日時": cache_time
@@ -1323,6 +1705,7 @@ def main():
                     column_config={
                         "アカウント": st.column_config.TextColumn("アカウント", width="medium"),
                         "ステータス": st.column_config.TextColumn("ステータス", width="small"),
+                        "データソース": st.column_config.TextColumn("データソース", width="small"),
                         "投稿数": st.column_config.NumberColumn("投稿数", width="small"),
                         "ペルソナ名": st.column_config.TextColumn("ペルソナ名", width="medium"),
                         "キャッシュ日時": st.column_config.TextColumn("キャッシュ日時", width="small")
@@ -1336,7 +1719,7 @@ def main():
                 with col1:
                     if st.button("🔄 選択したアカウントを再取得", use_container_width=True):
                         # フィルタされたアカウントを再取得
-                        for account, _, _ in filtered_accounts:
+                        for account, _, _, _ in filtered_accounts:
                             session_key = f"session_data_{account}"
                             if session_key in st.session_state:
                                 del st.session_state[session_key]
@@ -1351,7 +1734,7 @@ def main():
                     if st.button("📥 データをエクスポート", use_container_width=True):
                         # 全データをJSONでエクスポート
                         export_data = {}
-                        for account, data, _ in filtered_accounts:
+                        for account, data, _, _ in filtered_accounts:
                             export_data[account] = {
                                 'posts': data.get('posts', []),
                                 'persona': data.get('persona', {})
@@ -1368,7 +1751,7 @@ def main():
                 with col3:
                     if st.button("🗑️ 選択したアカウントを削除", use_container_width=True):
                         # フィルタされたアカウントを削除
-                        for account, _, _ in filtered_accounts:
+                        for account, _, _, _ in filtered_accounts:
                             if account in st.session_state['accounts_list']:
                                 st.session_state['accounts_list'].remove(account)
                             session_key = f"session_data_{account}"
@@ -1390,4 +1773,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
