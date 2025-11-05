@@ -122,6 +122,17 @@ def load_cache(key: str) -> Optional[any]:
     return None
 
 
+def delete_cache(key: str):
+    """キャッシュファイルを削除"""
+    cache_path = os.path.join(CACHE_DIR, f"{key}.pkl")
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+            logger.info(f"キャッシュ削除: {key}")
+        except Exception as e:
+            logger.warning(f"キャッシュ削除失敗: {str(e)}")
+
+
 def parse_uploaded_file(uploaded_file) -> List[str]:
     """
     アップロードされたファイルをパースしてアカウントリストを取得
@@ -297,6 +308,54 @@ def save_session_state():
         logger.error(f"セッション状態保存エラー: {str(e)}")
 
 
+def ensure_quality_score(
+    grok_api: GrokAPI,
+    persona_profile: Dict,
+    account_clean: str,
+    x_api: Optional[XAPIClient] = None
+) -> bool:
+    """
+    persona_profileがquality_scoreを持っていなければ評価して付与する。
+
+    Returns:
+        bool: quality_scoreを追加した場合はTrue
+    """
+    if not persona_profile or 'quality_score' in persona_profile:
+        return False
+
+    account_info = {
+        "handle": account_clean,
+        "description": persona_profile.get('background', ''),
+        "confidence": persona_profile.get('confidence', 0.8)
+    }
+
+    try:
+        quality_result = grok_api.check_account_quality(
+            account_clean,
+            account_info,
+            x_api_client=x_api
+        )
+    except Exception as error:
+        logger.warning(f"quality_score算出に失敗: @{account_clean} - {error}")
+        return False
+
+    if not quality_result:
+        return False
+
+    persona_profile['quality_score'] = quality_result['score']
+    persona_profile['quality_reasons'] = quality_result.get('reasons', [])
+    logger.info(f"📊 @{account_clean}: quality_score={quality_result['score']:.2f}を付与(UI)")
+    return True
+
+
+def has_generated_posts(posts: List[Dict]) -> bool:
+    """生成データ（sample_/generated_）かどうかを判定"""
+    if not posts:
+        return False
+    first_id = posts[0].get('id', '')
+    return first_id.startswith('sample_') or first_id.startswith('generated_')
+
+
 def fetch_and_analyze_posts(
     grok_api: GrokAPI, 
     account: str, 
@@ -327,7 +386,21 @@ def fetch_and_analyze_posts(
         data = st.session_state[session_key]
         # ステータスを即時反映
         st.session_state.setdefault('account_status', {})[account_clean] = 'cached_session'
-        return data['posts'], data['persona']
+        posts = data.get('posts', [])
+        if has_generated_posts(posts):
+            st.warning(
+                f"⚠️ @{account} のセッションキャッシュに生成データを検出しました。実データのみ再取得します。"
+            )
+            del st.session_state[session_key]
+            delete_cache(cache_key)
+        else:
+            persona = data.get('persona', {})
+            if ensure_quality_score(grok_api, persona, account_clean, x_api):
+                # セッション・キャッシュを更新（quality_scoreを追加）
+                data['persona'] = persona
+                st.session_state[session_key] = data
+                cache_data(cache_key, data)
+            return posts, persona
     
     # ファイルキャッシュチェック
     if use_cache and not force_refresh:
@@ -338,22 +411,31 @@ def fetch_and_analyze_posts(
             st.session_state[session_key] = cached
             # ステータスを即時反映
             st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
-            return cached['posts'], cached['persona']
+            posts = cached.get('posts', [])
+            if has_generated_posts(posts):
+                st.warning(
+                    f"⚠️ @{account}: キャッシュに生成データが含まれているため削除し再取得します。"
+                )
+                delete_cache(cache_key)
+                del st.session_state[session_key]
+            else:
+                persona = cached.get('persona', {})
+                if ensure_quality_score(grok_api, persona, account_clean, x_api):
+                    cached['persona'] = persona
+                    st.session_state[session_key] = cached
+                    cache_data(cache_key, cached)
+                return posts, persona
     
     # 投稿取得
     with st.spinner(f"📡 @{account}の投稿を取得中..."):
         try:
-            # 運用モードでは生成フォールバックを許可しない
-            mode_val = st.secrets.get("MODE", "dev")
-            is_operational_mode = str(mode_val).lower() in {"prod", "staging"}
-
             posts = grok_api.fetch_posts(
                 account, 
                 limit=DEFAULT_POST_LIMIT, 
                 since_date="2024-01-01",
                 x_api_client=x_api,
                 max_rate_wait_seconds=UI_MAX_RATE_WAIT_SECONDS if x_api else 900,
-                allow_generated=False if is_operational_mode else True
+                allow_generated=False
             )
         except APIConnectionError as err:
             st.warning(
@@ -372,13 +454,19 @@ def fetch_and_analyze_posts(
         return [], {}
     
     # 取得方法を判定して表示
+    if has_generated_posts(posts):
+        st.warning(
+            "⚠️ 生成データを検出したため、このアカウントは議論から除外します。\n"
+            "👉 ingest_accounts.py を使用して実データを再取得してください。"
+        )
+        st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+        delete_cache(cache_key)
+        return [], {}
+
     source = "unknown"
     if posts[0]['id'].startswith('web_search_'):
         st.success(f"✅ {len(posts)}件の実投稿を取得（🌐 Grok Web Search）")
         source = "web_search"
-    elif posts[0]['id'].startswith('sample_') or posts[0]['id'].startswith('generated_'):
-        st.info(f"📝 {len(posts)}件のサンプル投稿を生成（⚠️ フォールバック）")
-        source = "generated"
     else:
         st.success(f"✅ {len(posts)}件の実投稿を取得（🔑 X API v2）")
         source = "twitter"
@@ -400,6 +488,7 @@ def fetch_and_analyze_posts(
     if persona_profile:
         enrichment_note = "（マルチプラットフォーム分析）" if enable_web else ""
         st.success(f"✅ ペルソナ生成完了{enrichment_note}: {persona_profile.get('name', account)}")
+        ensure_quality_score(grok_api, persona_profile, account_clean, x_api)
     else:
         st.warning(
             "⚠️ ペルソナは未確定です（実データ不足または解析失敗）。\n"
@@ -737,9 +826,9 @@ def main():
         st.subheader("🌐 データソースフィルタ")
         source_filter = st.multiselect(
             "表示するデータソース",
-            options=["全て", "Twitter", "Web", "Sample", "Keyword", "Random"],
+            options=["全て", "Twitter", "Web", "Sample", "Keyword", "Random", "Diversity"],
             default=["全て"],
-            help="データ取得元でフィルタ（Twitter=🔑 X API, Web=🌐 Grok 検索, Sample=📝 フォールバック）"
+            help="データ取得元でフィルタ（Twitter=🔑 X API, Web=🌐 Grok 検索, Sample=📝 フォールバック, Diversity=多様性サンプリング）"
         )
         st.session_state["source_filter"] = source_filter
         
@@ -761,14 +850,53 @@ def main():
         with col_dk1:
             if st.button("🚀 収集開始", use_container_width=True):
                 st.session_state['discovery_in_progress'] = True
+                st.session_state['discovery_mode'] = 'keyword'
                 st.rerun()
         with col_dk2:
             dry_run = st.toggle("ドライラン", value=False, help="Grok未設定でも固定ダミーデータで動作確認")
 
+        st.caption("🧮 多様性サンプリング（ハイブリッド）")
+        use_diversity_sampling = st.checkbox(
+            "多様性サンプリングを実行する",
+            key="ui_use_diversity_sampling",
+            help="X APIとGrok Web Searchを組み合わせて多様性を担保した候補リストを収集します"
+        )
+        if use_diversity_sampling:
+            sampling_method = st.selectbox(
+                "サンプリング手法",
+                options=["stratified", "quota", "random"],
+                format_func=lambda x: {
+                    "stratified": "層化サンプリング",
+                    "quota": "クォータサンプリング",
+                    "random": "ランダムサンプリング"
+                }[x],
+                key="ui_diversity_sampling_method"
+            )
+            prefer_x_api_toggle = st.toggle(
+                "X APIを優先する",
+                value=st.session_state.get('use_x_api', True),
+                key="ui_diversity_prefer_x_api"
+            )
+            fallback_toggle = st.toggle(
+                "Grok Web Searchにフォールバックする",
+                value=True,
+                key="ui_diversity_fallback"
+            )
+            if st.button("🧮 多様性サンプリングを開始", use_container_width=True):
+                st.session_state['discovery_in_progress'] = True
+                st.session_state['discovery_mode'] = 'diversity'
+                st.session_state['diversity_params'] = {
+                    'sampling_method': sampling_method,
+                    'prefer_x_api': prefer_x_api_toggle,
+                    'fallback_to_grok': fallback_toggle,
+                    'dry_run': dry_run
+                }
+                st.rerun()
+
         st.caption("🎲 ランダム収集（プリセットクエリ）")
         if st.button("🎲 ランダム収集を開始", use_container_width=True):
             st.session_state['discovery_in_progress'] = True
-            st.session_state['discovery_random'] = True
+            st.session_state['discovery_mode'] = 'random'
             st.rerun()
 
         # 収集中の処理
@@ -778,7 +906,32 @@ def main():
                 discover_dir = Path(".cache/discover_results")
                 discover_dir.mkdir(parents=True, exist_ok=True)
 
-                if st.session_state.get('discovery_random', False):
+                mode = st.session_state.get('discovery_mode', 'keyword')
+
+                if mode == 'diversity':
+                    params = st.session_state.get('diversity_params', {}) or {}
+                    sampling_method = params.get('sampling_method', 'stratified')
+                    prefer_x_api_flag = params.get('prefer_x_api', True)
+                    fallback_flag = params.get('fallback_to_grok', True)
+                    cmd = [
+                        "python", "ingest_accounts.py", "--diversity-sampling",
+                        "--max-results", str(max_results)
+                    ]
+                    if sampling_method:
+                        cmd.extend(["--sampling-method", sampling_method])
+                    if not prefer_x_api_flag:
+                        cmd.append("--no-prefer-x-api")
+                    if not fallback_flag:
+                        cmd.append("--no-fallback-grok")
+                    if params.get('dry_run'):
+                        cmd.append("--dry-run")
+                    if not st.session_state.get('use_x_api', True):
+                        cmd.append("--no-x-api")
+                    subprocess.run(cmd, check=True)
+                    pattern_csv = str(discover_dir / f"diversity_{sampling_method}_hybrid_accounts_*.csv")
+                    pattern_txt = str(discover_dir / f"diversity_{sampling_method}_hybrid_accounts_*.txt")
+                    discovered_kind = "diversity_hybrid"
+                elif mode == 'random':
                     cmd = [
                         "python", "ingest_accounts.py", "--discover-random",
                         "--max-results", str(max_results)
@@ -882,7 +1035,8 @@ def main():
                 st.error(f"収集中にエラーが発生: {e}")
             finally:
                 st.session_state['discovery_in_progress'] = False
-                st.session_state.pop('discovery_random', None)
+                st.session_state.pop('discovery_mode', None)
+                st.session_state.pop('diversity_params', None)
                 st.rerun()
 
         # X API使用トグル
@@ -1204,42 +1358,96 @@ def main():
         # キャッシュがない、またはアカウントリストが変更された場合のみ取得
         logger.info("all_dataを新規取得")
         all_data = {}
+        failed_accounts: List[str] = []
         for account in accounts:
             # まずファイルキャッシュを明示的に確認（CLI→UI 連携を最優先）
             account_clean = account.lstrip('@')
             cache_key = f"posts_{account_clean}"
             session_key = f"session_data_{account_clean}"
+
             cached_data = load_cache(cache_key) if use_cache else None
+            new_account = account in new_accounts
 
-            # 新しいアカウントでもキャッシュがあれば再取得しない
-            force_refresh = (account in new_accounts) and (cached_data is None)
-            if account in new_accounts and not force_refresh:
-                st.info(f"📦 新しいアカウント: @{account} - キャッシュから即時ロード")
+            posts: List[Dict] = []
+            persona: Dict = {}
+            use_cached = False
 
-            if cached_data is not None and not force_refresh:
-                # キャッシュから復元してスキップ
-                st.session_state[session_key] = cached_data
-                st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
-                posts = cached_data.get('posts', [])
-                persona = cached_data.get('persona', {})
-            else:
-                if force_refresh:
+            if cached_data is not None:
+                cached_posts = cached_data.get('posts', [])
+                if has_generated_posts(cached_posts):
+                    st.warning(
+                        f"⚠️ @{account}: キャッシュに生成データが含まれているため削除し再取得します。"
+                    )
+                    delete_cache(cache_key)
+                    if session_key in st.session_state:
+                        del st.session_state[session_key]
+                    cached_data = None
+                else:
+                    if new_account:
+                        st.info(f"📦 新しいアカウント: @{account} - キャッシュから即時ロード")
+                    st.session_state[session_key] = cached_data
+                    st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
+                    posts = cached_posts
+                    persona = cached_data.get('persona', {})
+                    if ensure_quality_score(grok_api, persona, account_clean, x_api):
+                        cached_data['persona'] = persona
+                        st.session_state[session_key] = cached_data
+                        cache_data(cache_key, cached_data)
+                    use_cached = True
+
+            should_force_refresh = new_account and not use_cached
+
+            if not use_cached:
+                if new_account and should_force_refresh:
                     st.info(f"🆕 新しいアカウント: @{account} - 投稿を取得します")
                 posts, persona = fetch_and_analyze_posts(
-                    grok_api, 
-                    account, 
-                    use_cache, 
+                    grok_api,
+                    account,
+                    use_cache,
                     x_api,
-                    force_refresh=force_refresh
+                    force_refresh=should_force_refresh
                 )
-            all_data[account] = {
-                'posts': posts,
-                'persona': persona
-            }
-        
+
+            if posts and persona:
+                all_data[account] = {
+                    'posts': posts,
+                    'persona': persona
+                }
+            else:
+                failed_accounts.append(account)
+                st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+                # セッションキャッシュは失敗時に破棄して再試行しやすくする
+                if session_key in st.session_state:
+                    del st.session_state[session_key]
+
+        if failed_accounts:
+            st.info(f"🔄 {len(failed_accounts)}アカウントの再試行中...")
+            for account in failed_accounts:
+                account_clean = account.lstrip('@')
+                session_key = f"session_data_{account_clean}"
+                posts, persona = fetch_and_analyze_posts(
+                    grok_api,
+                    account,
+                    use_cache=False,
+                    x_api=x_api,
+                    force_refresh=True
+                )
+
+                if posts and persona:
+                    all_data[account] = {
+                        'posts': posts,
+                        'persona': persona
+                    }
+                    st.success(f"✅ @{account}: 再試行で取得成功")
+                else:
+                    st.warning(f"⚠️ @{account}: 再試行後も取得失敗 - 議論から除外")
+                    st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+                    if session_key in st.session_state:
+                        del st.session_state[session_key]
+
         # all_dataをセッション状態に保存
         st.session_state[all_data_key] = all_data
-        st.session_state['cached_accounts_key'] = current_accounts_key
+        st.session_state['cached_accounts_key'] = tuple(sorted(all_data.keys()))
         logger.info(f"all_dataをセッションキャッシュに保存: {len(all_data)}アカウント")
     
     # タブ作成
@@ -1605,6 +1813,8 @@ def main():
                     source_cat = 'Keyword'
                 elif source_val == 'grok_random':
                     source_cat = 'Random'
+                elif source_val == 'diversity_hybrid':
+                    source_cat = 'Diversity'
                 else:
                     source_cat = 'Unknown'
                 
@@ -1625,6 +1835,8 @@ def main():
                         source_cat = 'Keyword'
                     elif disc == 'grok_random':
                         source_cat = 'Random'
+                    elif disc == 'diversity_hybrid':
+                        source_cat = 'Diversity'
                 
                 filtered_accounts.append((account, data, account_status, source_cat))
             

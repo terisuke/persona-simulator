@@ -7,12 +7,10 @@ import requests
 import os
 import logging
 import json
+import time
 from typing import List, Dict, Optional
 from datetime import datetime
 from .error_handler import (
-    ErrorHandler, 
-    PerformanceLogger,
-    APIConnectionError,
     log_function_call
 )
 
@@ -59,9 +57,6 @@ def log_structured_api_call(
 
 # 定数定義
 MAX_CITATION_POSTS = 3  # 引用する投稿の最大数
-# 生成フォールバックのデフォルト許可可否（運用では False を強制）
-ALLOW_GENERATED_DEFAULT = False
-
 # プリセットキーワード（頻出分野）
 PRESET_KEYWORDS = {
     "ai_engineer": "AI engineer",
@@ -120,173 +115,177 @@ class GrokAPI:
     
     @log_function_call
     def fetch_posts(
-        self, 
-        account: str, 
-        limit: int = 20, 
+        self,
+        account: str,
+        limit: int = 20,
         since_date: str = "2024-01-01",
         x_api_client=None,
         max_rate_wait_seconds: int = 900,
         allow_generated: Optional[bool] = None
     ) -> List[Dict]:
         """
-        指定されたXアカウントの投稿を取得
+        指定されたXアカウントの投稿を取得（実データのみ）
         
-        取得優先順位:
+        取得優先順位（各手段で最大1回リトライ）:
         1. X API v2 (fetch_user_tweets)
         2. X API v2 (search_recent_tweets with from:username)
         3. Grok Realtime Web Search
-        4. フォールバック: サンプル投稿生成
+        4. すべて失敗した場合は空リストを返す
         
         Args:
             account: Xアカウント名（@付きでも可）
             limit: 取得する投稿数
             since_date: この日付以降の投稿を取得（X API使用時）
-            x_api_client: X APIクライアント（オプション）
-            max_rate_wait_seconds: X API利用時に待機する最大秒数（UIでは0など短めに設定）
+            x_api_client: X APIクライアント
+            max_rate_wait_seconds: X API利用時に待機する最大秒数
+            allow_generated: 後方互換性のためのパラメータ（無視される）
             
         Returns:
-            投稿リスト [{"id": str, "text": str, "link": str, "date": str}]
+            投稿リスト [{"id": str, "text": str, "link": str, "date": str}]。失敗時は空リスト。
         """
-        # @を削除
         account = account.lstrip("@")
-        
-        # X API v2が利用可能な場合は実投稿を取得
+
+        if allow_generated:
+            logger.warning(
+                "allow_generated=True が指定されましたが、生成フォールバックは無効です。実データのみを使用します。"
+            )
+
+        def _should_retry_error(error: Exception) -> bool:
+            """一時的なエラーかどうかを判定"""
+            status_code = getattr(error, "status_code", None)
+            if status_code in {401, 403, 404, 429}:
+                return False
+
+            error_str = str(error).lower()
+            retriable_keywords = [
+                "timeout",
+                "connection",
+                "temporarily",
+                "503",
+                "500",
+                "502",
+                "504",
+                "network",
+            ]
+            return any(keyword in error_str for keyword in retriable_keywords)
+
         if x_api_client:
-            # 方法1: ユーザーIDベースの取得を試行
-            try:
-                logger.info(f"[方法1] X APIでユーザーツイートを取得中: @{account}")
-                posts = x_api_client.fetch_user_tweets(
-                    account,
-                    max_results=limit,
-                    max_wait_seconds=max_rate_wait_seconds
-                )
-                if posts:
-                    logger.info(f"✅ X API (fetch_user_tweets) 成功: {len(posts)}件")
-                    # 構造化ログは x_api_client 内で出力済み
-                    return posts
-            except Exception as e:
-                logger.warning(f"[方法1] 失敗: {str(e)}")
-            
-            # 方法2: 検索APIを使用（from:username クエリ）
-            try:
-                logger.info(f"[方法2] X API検索を試行中: from:{account}")
-                search_query = f"from:{account} -is:retweet -is:reply"
-                posts = x_api_client.search_recent_tweets(
-                    search_query,
-                    max_results=limit,
-                    max_wait_seconds=max_rate_wait_seconds
-                )
-                if posts:
-                    logger.info(f"✅ X API (search_recent_tweets) 成功: {len(posts)}件")
-                    # 構造化ログは x_api_client 内で出力済み
-                    return posts
-            except Exception as e:
-                logger.warning(f"[方法2] 失敗: {str(e)}")
-            
-            logger.info("X API両方失敗、次の方法へフォールバック")
-        
+            # 方法1: fetch_user_tweets
+            for attempt in range(2):
+                if attempt == 0:
+                    logger.info(f"[方法1] X APIでユーザーツイートを取得中: @{account}")
+                else:
+                    logger.info(f"[方法1] リトライ: @{account} (試行{attempt + 1}/2)")
+                    time.sleep(2)
+
+                try:
+                    posts = x_api_client.fetch_user_tweets(
+                        account,
+                        max_results=limit,
+                        max_wait_seconds=max_rate_wait_seconds,
+                    )
+                    if posts:
+                        if attempt > 0:
+                            logger.info(f"✅ X API (fetch_user_tweets) リトライ成功: {len(posts)}件")
+                        else:
+                            logger.info(f"✅ X API (fetch_user_tweets) 成功: {len(posts)}件")
+                        return posts
+
+                    logger.info("[方法1] 投稿が見つかりませんでした。方法2へ移行します。")
+                    break
+                except Exception as error:
+                    if attempt == 0 and _should_retry_error(error):
+                        logger.warning(f"[方法1] 失敗（リトライ実施）: {error}")
+                        continue
+                    logger.warning(f"[方法1] 失敗（リトライ不可または再試行後も失敗）: {error}")
+                    break
+
+            # 方法2: search_recent_tweets
+            for attempt in range(2):
+                if attempt == 0:
+                    logger.info(f"[方法2] X API検索を試行中: from:{account}")
+                else:
+                    logger.info(f"[方法2] リトライ: from:{account} (試行{attempt + 1}/2)")
+                    time.sleep(2)
+
+                try:
+                    search_query = f"from:{account} -is:retweet -is:reply"
+                    posts = x_api_client.search_recent_tweets(
+                        search_query,
+                        max_results=limit,
+                        max_wait_seconds=max_rate_wait_seconds,
+                    )
+                    if posts:
+                        if attempt > 0:
+                            logger.info(f"✅ X API (search_recent_tweets) リトライ成功: {len(posts)}件")
+                        else:
+                            logger.info(f"✅ X API (search_recent_tweets) 成功: {len(posts)}件")
+                        return posts
+
+                    logger.info("[方法2] 投稿が見つかりませんでした。Web検索へ移行します。")
+                    break
+                except Exception as error:
+                    if attempt == 0 and _should_retry_error(error):
+                        logger.warning(f"[方法2] 失敗（リトライ実施）: {error}")
+                        continue
+                    logger.warning(f"[方法2] 失敗（リトライ不可または再試行後も失敗）: {error}")
+                    break
+
+            logger.info("X API両方失敗、Grok Web Searchにフォールバックします。")
+
         # 方法3: Grok Realtime Web Searchで実投稿を取得
-        logger.info(f"[方法3] Grok Web Searchで実投稿を検索中: @{account}")
-        # 環境に応じた検索パラメータ（例: 言語・地域）を付与
         search_params = {
             "lang": os.environ.get("GROK_SEARCH_LANG"),
-            "region": os.environ.get("GROK_SEARCH_REGION")
+            "region": os.environ.get("GROK_SEARCH_REGION"),
         }
-        web_posts = self._fetch_posts_via_web_search(account, limit, search_parameters=search_params)
-        if web_posts:
-            logger.info(f"✅ Grok Web Search 成功: {len(web_posts)}件")
-            log_structured_api_call(
-                source="web_search",
-                account=account,
-                generated_flag=False,
-                post_count=len(web_posts)
-            )
-            return web_posts
-        
-        # 方法4: フォールバック - LLMでサンプル投稿生成
-        logger.info(f"[方法4] フォールバック: サンプル投稿を生成中: @{account} (limit={limit})")
-        # 運用ポリシー: 明示的に許可されない限り、生成データを返さない
-        allow = ALLOW_GENERATED_DEFAULT if allow_generated is None else bool(allow_generated)
-        if not allow:
-            logger.warning("生成フォールバックは無効化されています（allow_generated=False）。空リストを返します。")
-            log_structured_api_call(
-                source="generated",
-                account=account,
-                generated_flag=True,
-                allowed=False,
-                post_count=0
-            )
-            return []
-        
-        try:
-            with PerformanceLogger(f"投稿生成: @{account}"):
-                # Grok LLMを使用してリアルな投稿例を生成
-                prompt = f"""@{account}というXアカウントの投稿を{limit}件生成してください。
-このアカウントは以下の特徴を持つと仮定します：
-- テック系起業家またはデータサイエンティスト
-- AI、機械学習、Web開発に興味がある
-- カジュアルな口調（「だなぁ」「んだよね」「w」を使う）
-- ポジティブで経験重視
-- 絵文字や感嘆符を使う
 
-以下のJSON配列形式で出力してください：
-[
-  {{"text": "投稿内容1", "date": "2024-10-15"}},
-  {{"text": "投稿内容2", "date": "2024-10-14"}},
-  ...
-]
+        for attempt in range(2):
+            if attempt == 0:
+                logger.info(f"[方法3] Grok Web Searchで実投稿を検索中: @{account}")
+            else:
+                logger.info(f"[方法3] リトライ: @{account} (試行{attempt + 1}/2)")
+                time.sleep(3)
 
-投稿は具体的で、テクノロジー、起業、学習、日常などのトピックを含めてください。
-JSON配列のみを出力し、他の説明は不要です。"""
+            try:
+                web_posts = self._fetch_posts_via_web_search(
+                    account,
+                    limit,
+                    search_parameters=search_params,
+                )
+                if web_posts:
+                    if attempt > 0:
+                        logger.info(f"✅ Grok Web Search リトライ成功: {len(web_posts)}件")
+                    else:
+                        logger.info(f"✅ Grok Web Search 成功: {len(web_posts)}件")
+                    log_structured_api_call(
+                        source="web_search",
+                        account=account,
+                        generated_flag=False,
+                        post_count=len(web_posts),
+                        attempt=attempt + 1,
+                    )
+                    return web_posts
 
-                result = self.generate_completion(prompt, temperature=0.8, max_tokens=2000)
-                
-                if result:
-                    import json
-                    # JSONパース
-                    result_clean = result.strip()
-                    if result_clean.startswith("```"):
-                        result_clean = result_clean.split("```")[1]
-                        if result_clean.startswith("json"):
-                            result_clean = result_clean[4:]
-                        result_clean = result_clean.strip()
-                    
-                    try:
-                        generated_posts = json.loads(result_clean)
-                        
-                        # 投稿リストに変換
-                        posts = []
-                        for i, post_data in enumerate(generated_posts[:limit]):
-                            posts.append({
-                                "id": f"generated_{account}_{i}",
-                                "text": post_data.get("text", ""),
-                                "link": f"https://x.com/{account}/status/generated_{i}",
-                                "date": post_data.get("date", "2024-10-15")
-                            })
-                        
-                        logger.info(f"LLM生成完了: {len(posts)}件の投稿")
-                        log_structured_api_call(
-                            source="generated",
-                            account=account,
-                            generated_flag=True,
-                            allowed=True,
-                            post_count=len(posts)
-                        )
-                        return posts
-                    
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"JSON パース失敗: {e}")
-                        # フォールバック: デフォルトサンプル投稿
-                        return self._get_sample_posts(account, limit)
-                else:
-                    logger.warning("LLM生成失敗、サンプル投稿を使用")
-                    return self._get_sample_posts(account, limit)
-                
-        except Exception as e:
-            ErrorHandler.log_error(e, f"投稿生成: @{account}")
-            logger.warning("エラー発生、サンプル投稿を使用")
-            return self._get_sample_posts(account, limit)
-    
+                logger.info("[方法3] Web検索で投稿が見つかりませんでした。")
+                break
+            except Exception as error:
+                if attempt == 0 and _should_retry_error(error):
+                    logger.warning(f"[方法3] 失敗（リトライ実施）: {error}")
+                    continue
+                logger.warning(f"[方法3] 失敗（リトライ不可または再試行後も失敗）: {error}")
+                break
+
+        logger.warning(f"❌ @{account}: すべての実データ取得方法が失敗したため、アカウントを除外します。")
+        log_structured_api_call(
+            source="unknown",
+            account=account,
+            generated_flag=False,
+            allowed=False,
+            post_count=0,
+            reason="all_real_data_sources_failed",
+        )
+        return []
+
     def generate_completion(
         self, 
         prompt: str, 
@@ -520,6 +519,10 @@ JSON配列のみを出力し、他の説明は不要です。"""
 4. **口調**: 文体の特徴（例: カジュアル、感嘆符/絵文字多用、ユーモア「w」「ぐぬぬぬ」など）
 5. **性格**: 全体的な印象（例: 経験重視、ポジティブ、自己反省的、ユーモア交じり）
 
+必ず守るルール：
+- 出力はすべて自然な日本語で記述する（原文が英語でも日本語に翻訳する）
+- JSON内の値も日本語で表現する
+
 JSON形式で出力してください：
 {{
   "name": "名前",
@@ -607,6 +610,7 @@ JSON形式で出力してください：
 このトピックについて、ペルソナの口調と性格を**徹底的に模倣**して意見を述べてください。
 - 口調の特徴（カジュアル、感嘆符、絵文字、「w」「だなぁ」など）を必ず含める
 - 性格（経験重視、ユーモア交じり、ポジティブなど）を反映
+- すべて自然な日本語で回答し、英語表現が含まれる場合は日本語に言い換える
 - 可能であれば過去の投稿を引用（[1]、[2]の形式で参照）
 - Web検索を有効にした場合、最新情報も参照
 - 150-300文字程度
@@ -686,6 +690,7 @@ JSON形式で出力してください：
 - 建設的な反論（相手の意見を一部認めつつ、自分の視点を示す）
 - 攻撃的にならず、議論を深める
 - 具体例や経験があれば言及
+- すべて自然な日本語で回答し、英語の引用は日本語に言い換える
 - 100-200文字程度{web_search_note}
 
 反論:
@@ -795,50 +800,6 @@ JSON配列のみを出力し、他の説明は不要です。"""
             logger.error(f"Web検索エラー: {str(e)}")
             return []
     
-    def _get_sample_posts(self, account: str, limit: int) -> List[Dict]:
-        """
-        サンプル投稿を返す（全ての方法が失敗した時の最終フォールバック）
-        
-        Args:
-            account: アカウント名
-            limit: 投稿数
-            
-        Returns:
-            サンプル投稿リスト
-        """
-        sample_posts = [
-            {"text": "AIの倫理って難しいよなぁ。経験から言うと、後出しジャンケンみたいで可哀想だわw でも大事なことだから議論は続けるべきだね！", "date": "2024-10-15"},
-            {"text": "今日もコード書いてる！！ 実装しながら学ぶのが一番だと思うんだよね。理論も大事だけど、手を動かさないと身につかない💪", "date": "2024-10-14"},
-            {"text": "リモートワーク最高だなぁ。集中できる時間が増えたし、家族との時間も取れる。これからの働き方のスタンダードになりそう😊", "date": "2024-10-13"},
-            {"text": "機械学習モデルのデプロイって奥が深い... 学術的な精度よりも実運用の安定性が大事なんだよね。今日もまた学びがあった✨", "date": "2024-10-12"},
-            {"text": "音楽とテクノロジーの融合って最高だと思うんだ！AI作曲も面白いけど、人間の感性は残したいよね🎵", "date": "2024-10-11"},
-            {"text": "起業して分かったこと: 完璧な準備なんてない。走りながら学ぶしかないんだよなぁw ぐぬぬぬ！", "date": "2024-10-10"},
-            {"text": "データサイエンスの実務で大事なのは、綺麗なコードよりも「動くコード」だと思う。もちろん両方目指すけどね！", "date": "2024-10-09"},
-            {"text": "今日のランチは美味しかった😋 仕事も大事だけど、食事も大事！健康第一だよね", "date": "2024-10-08"},
-            {"text": "Web3の可能性について考えてた。技術は面白いけど、実用化までの道のりは長そうだなぁ...", "date": "2024-10-07"},
-            {"text": "朝活で勉強してる！早起きは三文の徳って本当だね。集中力が全然違う✨", "date": "2024-10-06"},
-            {"text": "チーム開発って難しい。コミュニケーションが全てだと実感してる。コードだけじゃないんだよね", "date": "2024-10-05"},
-            {"text": "新しいフレームワーク試してみた！学習コスト高いけど、楽しいw こういう探求心を失いたくないな", "date": "2024-10-04"},
-            {"text": "失敗から学ぶことの方が多いんだよなぁ。成功体験よりも失敗体験の方が記憶に残る💡", "date": "2024-10-03"},
-            {"text": "今日はコーヒー3杯目w カフェイン摂取量やばいけど、集中したい時はしょうがない😅", "date": "2024-10-02"},
-            {"text": "テクノロジーで社会問題を解決したい。理想論かもしれないけど、そういう夢を持ち続けたいんだ！", "date": "2024-10-01"},
-            {"text": "読書タイム📚 技術書だけじゃなくて、哲学書も読むと視野が広がるよね", "date": "2024-09-30"},
-            {"text": "デバッグ中... バグとの戦いは終わらないなぁw でもこれがプログラミングの醍醐味！", "date": "2024-09-29"},
-            {"text": "メンターに相談したら目から鱗だった。経験者のアドバイスって本当に価値があるよね🙏", "date": "2024-09-28"},
-            {"text": "今日も一歩前進！小さな積み重ねが大きな成果につながると信じてる💪", "date": "2024-09-27"},
-            {"text": "感謝の気持ちを忘れずに。周りの人のサポートがあってこそだよなぁ✨ ありがとう！！", "date": "2024-09-26"}
-        ]
-        
-        posts = []
-        for i, post_data in enumerate(sample_posts[:limit]):
-            posts.append({
-                "id": f"sample_{account}_{i}",
-                "text": post_data["text"],
-                "link": f"https://x.com/{account}/status/sample_{i}",
-                "date": post_data["date"]
-            })
-        
-        return posts
     
     def _default_persona(self) -> Dict:
         """デフォルトのペルソナプロファイル"""
@@ -1144,6 +1105,88 @@ JSON配列のみを出力し、他の説明は不要です。"""
 
         logger.info(f"✅ ランダム検索完了: {len(all_accounts)}件のアカウント候補を発見")
         return all_accounts
+
+    def discover_accounts_with_diversity_hybrid(
+        self,
+        max_results: int = 50,
+        sampling_method: str = "stratified",
+        x_api_client=None,
+        quotas: Optional[Dict] = None,
+        prefer_x_api: bool = True,
+        fallback_to_grok: bool = True
+    ) -> List[Dict]:
+        """
+        X APIとGrok Web Searchを組み合わせ、多様性を担保したアカウントリストを取得
+        
+        2段階アプローチ:
+        1. データソースのハイブリッド: X APIとGrok Web Searchから候補を収集・統合
+        2. サンプリング手法の適用: 選択した手法（stratified/quota/random）を適用
+        
+        Args:
+            max_results: 最大取得件数
+            sampling_method: サンプリング手法（"stratified", "quota", "random"）
+                - "stratified": 確率サンプリング（層化サンプリング）
+                - "quota": 非確率サンプリング（クォータサンプリング）
+                - "random": 確率サンプリング（ランダムサンプリング）
+            x_api_client: X APIクライアント
+            quotas: クォータ設定（sampling_method="quota"の場合）
+            prefer_x_api: X APIを優先するか
+            fallback_to_grok: Grok Web Searchにフォールバックするか
+        
+        Returns:
+            多様性指標付きのアカウントリスト
+        
+        Note:
+            「ハイブリッド」はデータソースの組み合わせを指し、
+            サンプリング手法の組み合わせではありません。
+        """
+        from .diversity_sampling import DiversitySampler
+
+        logger.info(
+            "🎲 ハイブリッド多様性サンプリング開始 "
+            f"(max_results={max_results}, method={sampling_method}, "
+            f"prefer_x_api={prefer_x_api}, fallback_to_grok={fallback_to_grok})"
+        )
+
+        queries: List[str] = []
+
+        regions = ["JP", "US", "GB", "KR", "IN"]
+        for region in regions:
+            queries.append(f"influential accounts region:{region}")
+
+        languages = ["ja", "en", "ko"]
+        for lang in languages:
+            queries.append(f"popular Twitter accounts lang:{lang}")
+
+        category_keywords = [
+            "AI engineer",
+            "data scientist",
+            "startup founder",
+            "venture capitalist",
+            "tech executive",
+            "cybersecurity expert"
+        ]
+        queries.extend(category_keywords)
+
+        import random
+
+        random.shuffle(queries)
+
+        sampler = DiversitySampler(x_api_client=x_api_client, grok_api=self)
+
+        accounts = sampler.discover_accounts_hybrid(
+            queries=queries[:20],
+            max_results=max_results,
+            prefer_x_api=prefer_x_api,
+            fallback_to_grok=fallback_to_grok,
+            sampling_method=sampling_method
+        )
+
+        if sampling_method == "quota" and quotas:
+            accounts = sampler.quota_sampling(accounts, quotas=quotas, max_total=max_results)
+
+        logger.info(f"✅ ハイブリッド多様性サンプリング完了: {len(accounts)}件")
+        return accounts
 
     def _generate_mock_accounts(
         self,
