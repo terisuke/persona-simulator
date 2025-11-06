@@ -161,6 +161,11 @@ class APIConnectionError(PersonaSimulatorError):
     pass
 
 
+class RateLimitError(APIConnectionError):
+    """レート制限エラー"""
+    pass
+
+
 class DataProcessingError(PersonaSimulatorError):
     """データ処理エラー"""
     pass

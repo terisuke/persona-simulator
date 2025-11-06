@@ -21,6 +21,7 @@ import os
 import logging
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -54,9 +55,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 生成フォールバックの許可フラグ（モジュール全体で参照）。
-# デフォルトは開発用途を想定して True。main() で MODE/引数により上書き。
-ALLOW_GENERATED_FLAG: bool = True
+# 生成フォールバックの許可フラグ（後方互換性のため残置）。
+# 現在は常に False（実データのみ運用）。
+ALLOW_GENERATED_FLAG: bool = False
+
+
+def delete_cache_file(cache_key: str):
+    """対象キャッシュファイルを削除"""
+    cache_path = os.path.join('.cache', f"{cache_key}.pkl")
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+            logger.info(f"キャッシュ削除: {cache_key}")
+        except Exception as error:
+            logger.warning(f"キャッシュ削除失敗({cache_key}): {error}")
 
 
 class FetchStatus(Enum):
@@ -74,7 +86,6 @@ class FetchResult:
     - source フィールドは以下の値をサポート予定:
       - "twitter": X API v2 経由で取得
       - "web_search": Grok Web Search 経由で取得
-      - "generated": フォールバック生成
       - "facebook": Facebook Graph API 経由（Stage3）
       - "instagram": Instagram Graph API 経由（Stage3）
       - "linkedin": LinkedIn Marketing API 経由（Stage3）
@@ -84,7 +95,7 @@ class FetchResult:
     posts: List[Dict]
     persona: Dict
     status: FetchStatus
-    source: str  # "twitter" | "web_search" | "generated" | "facebook" | "instagram" | "linkedin" | "tiktok"
+    source: str  # "twitter" | "web_search" | "facebook" | "instagram" | "linkedin" | "tiktok"
 
 
 class RateLimitManager:
@@ -184,15 +195,22 @@ def fetch_account_data(
     if not force_refresh:
         cached = load_cache(cache_key)
         if cached:
-            logger.info(f"📦 @{account_clean}: キャッシュから読み込み (スキップ)")
-            # キャッシュに保存されたsourceを使用（なければ"unknown"）
-            cached_source = cached.get('source', 'unknown')
-            return FetchResult(
-                posts=cached['posts'],
-                persona=cached['persona'],
-                status=FetchStatus.CACHED,
-                source=cached_source
-            )
+            cached_posts = cached.get('posts', [])
+            if cached_posts and (cached_posts[0].get('id', '').startswith('sample_') or cached_posts[0].get('id', '').startswith('generated_')):
+                logger.warning(
+                    f"⚠️ @{account_clean}: キャッシュに生成データが含まれているため削除し再取得します。"
+                )
+                delete_cache_file(cache_key)
+            else:
+                logger.info(f"📦 @{account_clean}: キャッシュから読み込み (スキップ)")
+                # キャッシュに保存されたsourceを使用（なければ"unknown"）
+                cached_source = cached.get('source', 'unknown')
+                return FetchResult(
+                    posts=cached['posts'],
+                    persona=cached['persona'],
+                    status=FetchStatus.CACHED,
+                    source=cached_source
+                )
 
     # レートリミットチェック
     rate_limiter.wait_if_needed()
@@ -221,9 +239,6 @@ def fetch_account_data(
         if posts[0]['id'].startswith('web_search_'):
             source = "web_search"
             logger.info(f"✅ @{account_clean}: {len(posts)}件取得 (🌐 Grok Web Search)")
-        elif posts[0]['id'].startswith('sample_') or posts[0]['id'].startswith('generated_'):
-            source = "generated"
-            logger.info(f"📝 @{account_clean}: {len(posts)}件生成 (⚠️ フォールバック)")
         else:
             source = "twitter"
             logger.info(f"✅ @{account_clean}: {len(posts)}件取得 (🔑 X API v2)")
@@ -289,7 +304,12 @@ def discover_and_save_accounts(
     dry_run: bool,
     category: Optional[str] = None,
     preset: Optional[str] = None,
-    x_api: Optional[XAPIClient] = None
+    x_api: Optional[XAPIClient] = None,
+    diversity_sampling: bool = False,
+    sampling_method: str = "stratified",
+    prefer_x_api: bool = True,
+    fallback_to_grok: bool = True,
+    quotas: Optional[Dict] = None
 ) -> Optional[str]:
     """
     Grok Web Search でアカウント候補を発見し、CSV/TXT に保存
@@ -316,8 +336,27 @@ def discover_and_save_accounts(
         os.makedirs(discover_dir)
         logger.info(f"📁 ディレクトリ作成: {discover_dir}")
 
+    diversity_metrics: Dict[str, float] = {}
+    diversity_report_path: Optional[str] = None
+
     # アカウント発見
-    if preset:
+    if diversity_sampling:
+        logger.info(
+            "🎲 多様性サンプリングモード (ハイブリッド) を開始 "
+            f"(sampling_method={sampling_method}, prefer_x_api={prefer_x_api}, "
+            f"fallback_to_grok={fallback_to_grok})"
+        )
+        accounts = grok_api.discover_accounts_with_diversity_hybrid(
+            max_results=max_results,
+            sampling_method=sampling_method,
+            x_api_client=x_api,
+            quotas=quotas,
+            prefer_x_api=prefer_x_api,
+            fallback_to_grok=fallback_to_grok
+        )
+        mode = "diversity_hybrid"
+        filename_base = f"diversity_{sampling_method}_hybrid_accounts"
+    elif preset:
         # プリセットキーワードを使用
         actual_keyword = PRESET_KEYWORDS[preset]
         logger.info(f"🔍 プリセット '{preset}' ({actual_keyword}) でアカウント発見中...")
@@ -362,8 +401,24 @@ def discover_and_save_accounts(
     txt_path = os.path.join(discover_dir, f"{filename_base}_{timestamp}.txt")
 
     # CSV 保存（quality_score も含める）
+    fieldnames = [
+        'handle',
+        'display_name',
+        'confidence',
+        'profile_url',
+        'description',
+        'source',
+        'quality_score',
+        'diversity_score',
+        'followers_count',
+        'tweet_count',
+        'region',
+        'language',
+        'dominant_sentiment',
+        'last_tweet_at',
+        'account_created_at'
+    ]
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['handle', 'display_name', 'confidence', 'profile_url', 'description', 'source', 'quality_score']
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         for account in accounts:
@@ -382,6 +437,33 @@ def discover_and_save_accounts(
 
     logger.info(f"💾 TXT 保存: {txt_path} ({len(accounts)}件)")
 
+    # 多様性レポート作成
+    if diversity_sampling:
+        from utils.diversity_sampling import DiversitySampler
+
+        sampler = DiversitySampler(x_api_client=x_api, grok_api=grok_api)
+        diversity_metrics = sampler.calculate_diversity_metrics(
+            accounts,
+            attributes=['followers', 'region', 'language', 'sentiment']
+        )
+        diversity_report_path = csv_path.replace('.csv', '_diversity_report.txt')
+
+        with open(diversity_report_path, 'w', encoding='utf-8') as f:
+            f.write("=== ハイブリッド多様性サンプリングレポート ===\n\n")
+            f.write(f"サンプリング手法: {sampling_method}\n")
+            f.write(f"X API優先: {prefer_x_api}\n")
+            f.write(f"Grokフォールバック: {fallback_to_grok}\n")
+            f.write(f"総アカウント数: {len(accounts)}\n\n")
+            f.write("多様性指標:\n")
+            for key, value in diversity_metrics.items():
+                f.write(f"  {key}: {value:.3f}\n")
+            f.write("\nデータソース分布:\n")
+            source_counts = Counter(acc.get('source', 'unknown') for acc in accounts)
+            for source, count in source_counts.items():
+                f.write(f"  {source}: {count}件\n")
+
+        logger.info(f"📊 多様性レポート保存: {diversity_report_path}")
+
     # 統計表示
     logger.info("")
     logger.info("=" * 80)
@@ -389,9 +471,22 @@ def discover_and_save_accounts(
     logger.info("=" * 80)
     logger.info(f"モード: {mode}")
     logger.info(f"発見件数: {len(accounts)}")
-    logger.info(f"平均信頼度: {sum(a['confidence'] for a in accounts) / len(accounts):.2f}")
+    if any(a.get('confidence') is not None for a in accounts):
+        avg_conf = sum(a.get('confidence', 0.0) for a in accounts) / len(accounts)
+        logger.info(f"平均信頼度: {avg_conf:.2f}")
+    if diversity_metrics:
+        logger.info("多様性指標:")
+        for key, value in diversity_metrics.items():
+            logger.info(f"  {key}: {value:.3f}")
+    source_distribution = Counter(acc.get('source', 'unknown') for acc in accounts)
+    if source_distribution:
+        logger.info("データソース内訳:")
+        for source, count in source_distribution.items():
+            logger.info(f"  {source}: {count}件")
     logger.info(f"CSV: {csv_path}")
     logger.info(f"TXT: {txt_path}")
+    if diversity_report_path:
+        logger.info(f"Diversity Report: {diversity_report_path}")
     logger.info("=" * 80)
     logger.info("")
     logger.info("💡 次のステップ:")
@@ -629,6 +724,37 @@ def main():
         choices=list(PRESET_KEYWORDS.keys()),
         help=f'プリセットキーワード指定 - {", ".join(sorted(PRESET_KEYWORDS.keys()))}'
     )
+    discover_group.add_argument(
+        '--diversity-sampling',
+        action='store_true',
+        help='多様性を担保したハイブリッドサンプリングでアカウント候補を発見'
+    )
+    discover_group.add_argument(
+        '--sampling-method',
+        type=str,
+        choices=['stratified', 'quota', 'random'],
+        default='stratified',
+        help='多様性サンプリング時の手法（デフォルト: stratified）'
+    )
+    discover_group.add_argument(
+        '--prefer-x-api',
+        dest='prefer_x_api',
+        action='store_true',
+        help='X APIを優先して使用（デフォルト: 有効）'
+    )
+    discover_group.add_argument(
+        '--no-prefer-x-api',
+        dest='prefer_x_api',
+        action='store_false',
+        help='X API優先を無効化'
+    )
+    discover_group.add_argument(
+        '--no-fallback-grok',
+        action='store_true',
+        help='Grok Web Searchへのフォールバックを無効化'
+    )
+
+    parser.set_defaults(prefer_x_api=True)
 
     parser.add_argument(
         '--batch-size',
@@ -669,12 +795,12 @@ def main():
     gen_group.add_argument(
         '--allow-generated',
         action='store_true',
-        help='フォールバック生成を許可（開発・デモ用途）'
+        help='【非推奨】生成フォールバックを許可（現在は無効化済み）'
     )
     gen_group.add_argument(
         '--disallow-generated',
         action='store_true',
-        help='フォールバック生成を禁止（運用用途）'
+        help='生成フォールバックを明示的に禁止（デフォルト）'
     )
 
     # X API使用可否の切替（相互排他）
@@ -702,19 +828,16 @@ def main():
         logger.error("❌ secrets.toml が読み込めませんでした。環境変数を確認してください。")
         sys.exit(1)
 
-    # MODE に応じたデフォルト設定（prod/staging: False, それ以外: True）
+    # MODE に関わらず生成フォールバックは常に無効化
     mode_val = (secrets.get('MODE') or os.environ.get('MODE') or 'dev').lower()
-    default_allow_generated = False if mode_val in {'prod', 'staging'} else True
-
-    # 引数で上書き
     global ALLOW_GENERATED_FLAG
+    ALLOW_GENERATED_FLAG = False
     if args.allow_generated:
-        ALLOW_GENERATED_FLAG = True
+        logger.warning("⚠️ --allow-generated は無効です。実データのみを使用します。")
     elif args.disallow_generated:
-        ALLOW_GENERATED_FLAG = False
+        logger.info("--disallow-generated 指定: 生成フォールバックは無効 (既定値)")
     else:
-        ALLOW_GENERATED_FLAG = default_allow_generated
-    logger.info(f"生成フォールバック許可: {ALLOW_GENERATED_FLAG} (MODE={mode_val})")
+        logger.info("生成フォールバック許可: False（固定運用）")
 
     # X API使用可否を決定
     if args.use_x_api:
@@ -739,15 +862,20 @@ def main():
     # =============================================================================
     # Stage 2.5: Discover モード（アカウント発見）
     # =============================================================================
-    if args.discover_keyword or args.discover_random or args.preset:
+    if args.discover_keyword or args.discover_random or args.preset or args.diversity_sampling:
         logger.info("=" * 80)
         logger.info("🔍 Stage 2.5: アカウント発見モード")
         logger.info("=" * 80)
 
         # 引数の検証（同時に複数の発見モードを指定しない）
-        mode_count = sum([bool(args.discover_keyword), bool(args.discover_random), bool(args.preset)])
+        mode_count = sum([
+            bool(args.discover_keyword),
+            bool(args.discover_random),
+            bool(args.preset),
+            bool(args.diversity_sampling)
+        ])
         if mode_count > 1:
-            logger.error("❌ --discover-keyword, --discover-random, --preset は同時に1つだけ指定してください")
+            logger.error("❌ --discover-keyword, --discover-random, --preset, --diversity-sampling は同時に1つだけ指定してください")
             sys.exit(1)
 
         # アカウント発見実行
@@ -765,7 +893,11 @@ def main():
             dry_run=args.dry_run,
             category=args.category,
             preset=args.preset,
-            x_api=x_api
+            x_api=x_api,
+            diversity_sampling=args.diversity_sampling,
+            sampling_method=args.sampling_method,
+            prefer_x_api=args.prefer_x_api,
+            fallback_to_grok=not args.no_fallback_grok
         )
 
         if saved_path:

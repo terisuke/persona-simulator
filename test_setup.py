@@ -83,6 +83,13 @@ def test_modules():
         logger.error(f"❌ utils.error_handler のインポート失敗: {e}")
         return False
     
+    try:
+        from utils.diversity_sampling import DiversitySampler
+        logger.info("✅ utils.diversity_sampling")
+    except ImportError as e:
+        logger.error(f"❌ utils.diversity_sampling のインポート失敗: {e}")
+        return False
+    
     return True
 
 
