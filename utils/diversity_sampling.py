@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 
 from textblob import TextBlob
 
+from utils.error_handler import APIConnectionError
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,6 +52,29 @@ class DiversitySampler:
     }
 
     LANGUAGES = ["ja", "en", "ko", "zh", "es", "fr", "de", "pt"]
+
+    # クォータ比率のデフォルト値
+    DEFAULT_FOLLOWER_QUOTAS = {
+        "micro": 1/6,
+        "small": 1/6,
+        "medium": 1/3,
+        "large": 1/4,
+        "macro": 1/12,
+        "mega": 1/12,
+    }
+
+    DEFAULT_REGION_QUOTAS = {
+        "JP": 1/2,
+        "US": 1/4,
+        "GB": 1/8,
+        "KR": 1/8,
+    }
+
+    DEFAULT_SENTIMENT_QUOTAS = {
+        "positive": 1/3,
+        "neutral": 1/3,
+        "negative": 1/3,
+    }
 
     def __init__(self, x_api_client=None, grok_api=None):
         """
@@ -117,10 +142,13 @@ class DiversitySampler:
                         logger.info(f"✅ X API成功: '{query}' → {len(account_batch)}件")
                     else:
                         x_api_failures += 1
-                except Exception as error:  # noqa: BLE001
+                except APIConnectionError as error:
                     logger.warning(f"⚠️ X API検索失敗: '{query}' - {error}")
                     x_api_failures += 1
                     account_batch = []
+                except Exception as error:
+                    logger.error(f"予期しないエラー: '{query}' - {error}", exc_info=True)
+                    raise
 
             if (not account_batch or len(account_batch) < 5) and fallback_to_grok and self.grok_api:
                 try:
@@ -133,8 +161,11 @@ class DiversitySampler:
                             if handle and handle not in existing_handles:
                                 account_batch.append(candidate)
                         logger.info(f"✅ Grok成功: '{query}' → {len(grok_batch)}件追加")
-                except Exception as error:  # noqa: BLE001
+                except APIConnectionError as error:
                     logger.warning(f"⚠️ Grok Web Search検索失敗: '{query}' - {error}")
+                except Exception as error:
+                    logger.error(f"予期しないエラー: '{query}' - {error}", exc_info=True)
+                    raise
 
             all_candidates.extend(account_batch)
 
@@ -210,9 +241,12 @@ class DiversitySampler:
                 user_handles.add(mention)
                 try:
                     users = self.x_api_client.fetch_user_by_handle([mention])
-                except Exception as error:  # noqa: BLE001
+                except APIConnectionError as error:
                     logger.debug(f"ユーザー情報取得失敗: @{mention} - {error}")
                     continue
+                except Exception as error:
+                    logger.error(f"予期しないエラー: @{mention} - {error}", exc_info=True)
+                    raise
 
                 if not users:
                     continue
@@ -277,23 +311,16 @@ class DiversitySampler:
         """クォータのデフォルト値を生成。"""
         return {
             "followers": {
-                "micro": max_total // 6,
-                "small": max_total // 6,
-                "medium": max_total // 3,
-                "large": max_total // 4,
-                "macro": max_total // 12,
-                "mega": max_total // 12,
+                stratum: int(max_total * ratio)
+                for stratum, ratio in self.DEFAULT_FOLLOWER_QUOTAS.items()
             },
             "region": {
-                "JP": max_total // 2,
-                "US": max_total // 4,
-                "GB": max_total // 8,
-                "KR": max_total // 8,
+                region: int(max_total * ratio)
+                for region, ratio in self.DEFAULT_REGION_QUOTAS.items()
             },
             "sentiment": {
-                "positive": max_total // 3,
-                "neutral": max_total // 3,
-                "negative": max_total // 3,
+                sentiment: int(max_total * ratio)
+                for sentiment, ratio in self.DEFAULT_SENTIMENT_QUOTAS.items()
             },
         }
 
@@ -471,8 +498,11 @@ class DiversitySampler:
                                 self.x_api_rate_limit_track["reset_at"] = datetime.fromisoformat(reset_at)
                             except ValueError:
                                 pass
-                except Exception as error:  # noqa: BLE001
+                except APIConnectionError as error:
                     logger.debug(f"メトリクス取得失敗: @{handle} - {error}")
+                except Exception as error:
+                    logger.error(f"予期しないエラー: @{handle} - {error}", exc_info=True)
+                    raise
 
             enriched_account["region"] = self._infer_region(enriched_account)
             enriched_account["language"] = self._infer_language(enriched_account)
@@ -533,7 +563,11 @@ class DiversitySampler:
             return "neutral"
         try:
             polarity = TextBlob(description).sentiment.polarity
-        except Exception:  # noqa: BLE001
+        except (ValueError, AttributeError) as error:
+            logger.debug(f"センチメント分析エラー: {error}")
+            return "neutral"
+        except Exception as error:
+            logger.error(f"予期しないエラー: {error}", exc_info=True)
             return "neutral"
         if polarity > 0.1:
             return "positive"

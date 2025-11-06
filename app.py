@@ -27,7 +27,7 @@ UI_MAX_RATE_WAIT_SECONDS = 0  # UIではレート制限待ちを実施しない
 # 自作モジュール
 from utils.grok_api import GrokAPI
 from utils.x_api import XAPIClient
-from utils.persona import PersonaManager
+from utils.persona import PersonaManager, PersonaProfile
 from utils.similarity import SimilaritySearcher
 from utils.debate_ui import DebateUI
 from utils.error_handler import APIConnectionError
@@ -228,6 +228,18 @@ def check_cache_status(accounts: List[str]) -> Dict[str, str]:
     return status
 
 
+def update_account_status(account: str, status: str):
+    """
+    アカウントステータスを原子的に更新
+    
+    Args:
+        account: アカウント名（@付きでも可）
+        status: ステータス（'cached_session', 'cached_file', 'pending', 'error', 'unverified'）
+    """
+    account_clean = account.lstrip('@')
+    st.session_state.setdefault('account_status', {})[account_clean] = status
+
+
 def initialize_session_state():
     """セッション状態を初期化"""
     if 'accounts_list' not in st.session_state:
@@ -310,7 +322,7 @@ def save_session_state():
 
 def ensure_quality_score(
     grok_api: GrokAPI,
-    persona_profile: Dict,
+    persona_profile: PersonaProfile,
     account_clean: str,
     x_api: Optional[XAPIClient] = None
 ) -> bool:
@@ -362,7 +374,7 @@ def fetch_and_analyze_posts(
     use_cache: bool = True,
     x_api: Optional[XAPIClient] = None,
     force_refresh: bool = False
-) -> tuple[List[Dict], Dict]:
+) -> tuple[List[Dict], PersonaProfile]:
     """
     投稿を取得してペルソナを生成
     
@@ -385,7 +397,7 @@ def fetch_and_analyze_posts(
         st.info(f"💾 セッションから@{account}のデータをロード（再取得不要）")
         data = st.session_state[session_key]
         # ステータスを即時反映
-        st.session_state.setdefault('account_status', {})[account_clean] = 'cached_session'
+        update_account_status(account_clean, 'cached_session')
         posts = data.get('posts', [])
         if has_generated_posts(posts):
             st.warning(
@@ -410,7 +422,7 @@ def fetch_and_analyze_posts(
             # セッション状態にも保存
             st.session_state[session_key] = cached
             # ステータスを即時反映
-            st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
+            update_account_status(account_clean, 'cached_file')
             posts = cached.get('posts', [])
             if has_generated_posts(posts):
                 st.warning(
@@ -444,13 +456,13 @@ def fetch_and_analyze_posts(
                 "詳しくは README の『一括管理モード』を参照してください。"
             )
             logger.warning(f"UIレート制限: @{account} - {err}")
-            st.session_state.setdefault('account_status', {})[account_clean] = 'error'
+            update_account_status(account_clean, 'error')
             return [], {}
     
     if not posts:
         st.warning(f"⚠️ @{account}の投稿が取得できませんでした")
         # エラーステータスを反映
-        st.session_state.setdefault('account_status', {})[account_clean] = 'error'
+        update_account_status(account_clean, 'error')
         return [], {}
     
     # 取得方法を判定して表示
@@ -459,7 +471,7 @@ def fetch_and_analyze_posts(
             "⚠️ 生成データを検出したため、このアカウントは議論から除外します。\n"
             "👉 ingest_accounts.py を使用して実データを再取得してください。"
         )
-        st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+        update_account_status(account_clean, 'unverified')
         delete_cache(cache_key)
         return [], {}
 
@@ -494,7 +506,7 @@ def fetch_and_analyze_posts(
             "⚠️ ペルソナは未確定です（実データ不足または解析失敗）。\n"
             "👉 まずは CLI のバッチ取得で実投稿のキャッシュ生成を行ってください。"
         )
-        st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+        update_account_status(account_clean, 'unverified')
     
     # データを保存
     data = {
@@ -510,9 +522,8 @@ def fetch_and_analyze_posts(
     # セッション状態にも保存（自動再実行時に再取得を防ぐ）
     st.session_state[session_key] = data
     # ステータスを反映（未確定の場合は unverified）
-    st.session_state.setdefault('account_status', {})[account_clean] = (
-        'cached_session' if persona_profile else 'unverified'
-    )
+    status = 'cached_session' if persona_profile else 'unverified'
+    update_account_status(account_clean, status)
     
     return posts, persona_profile
 
@@ -1136,7 +1147,7 @@ def main():
             if st.button("🔁 エラーを再試行", use_container_width=True):
                 # エラー状態をpendingへ戻し、次のバッチで再取得
                 for a in error_accounts:
-                    st.session_state['account_status'][a] = 'pending'
+                    update_account_status(a, 'pending')
                 # サマリ・メトリクスを即時更新
                 st.session_state['account_status'] = check_cache_status(st.session_state.get('accounts_list', []))
                 st.session_state['batch_processing'] = True
@@ -1281,16 +1292,16 @@ def main():
                             
                             if posts and persona:
                                 # ステータスを更新
-                                st.session_state['account_status'][account] = 'cached_session'
+                                update_account_status(account, 'cached_session')
                                 st.success(f"✅ @{account}のデータを取得完了")
                             else:
                                 st.warning(f"⚠️ @{account}のデータ取得に失敗")
-                                st.session_state['account_status'][account] = 'error'
+                                update_account_status(account, 'error')
                                 
                         except Exception as e:
                             st.error(f"❌ @{account}の処理中にエラー: {str(e)}")
                             logger.error(f"バッチ処理エラー @{account}: {str(e)}")
-                            st.session_state['account_status'][account] = 'error'
+                            update_account_status(account, 'error')
                 
                 # 処理済みカウントを更新
                 st.session_state['batch_processed_count'] = end_idx
@@ -1386,7 +1397,7 @@ def main():
                     if new_account:
                         st.info(f"📦 新しいアカウント: @{account} - キャッシュから即時ロード")
                     st.session_state[session_key] = cached_data
-                    st.session_state.setdefault('account_status', {})[account_clean] = 'cached_file'
+                    update_account_status(account_clean, 'cached_file')
                     posts = cached_posts
                     persona = cached_data.get('persona', {})
                     if ensure_quality_score(grok_api, persona, account_clean, x_api):
@@ -1415,7 +1426,7 @@ def main():
                 }
             else:
                 failed_accounts.append(account)
-                st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+                update_account_status(account_clean, 'unverified')
                 # セッションキャッシュは失敗時に破棄して再試行しやすくする
                 if session_key in st.session_state:
                     del st.session_state[session_key]
@@ -1441,7 +1452,7 @@ def main():
                     st.success(f"✅ @{account}: 再試行で取得成功")
                 else:
                     st.warning(f"⚠️ @{account}: 再試行後も取得失敗 - 議論から除外")
-                    st.session_state.setdefault('account_status', {})[account_clean] = 'unverified'
+                    update_account_status(account_clean, 'unverified')
                     if session_key in st.session_state:
                         del st.session_state[session_key]
 

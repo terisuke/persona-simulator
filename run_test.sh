@@ -277,6 +277,22 @@ echo "  - キャッシュ済み: 4件 (cor_terisuke, elonmusk, karpathy, goodfel
 echo "  - 未取得: 4件 (sama, ylecun, AndrewYNg, lexfridman)"
 echo ""
 
+# ステップ9: 多様性サンプリング機能のテスト
+echo "🧮 ステップ9: 多様性サンプリング機能のテスト"
+echo "--------------------------------------------------"
+
+print_info "多様性サンプリング機能をテストします（ドライラン）"
+python ingest_accounts.py --diversity-sampling --max-results 10 --dry-run --sampling-method stratified
+
+DIVERSITY_EXIT_CODE=$?
+if [ $DIVERSITY_EXIT_CODE -eq 0 ]; then
+    print_success "多様性サンプリング機能のテストが完了しました"
+else
+    print_warning "多様性サンプリング機能のテストが失敗しました (終了コード: $DIVERSITY_EXIT_CODE)"
+    print_info "これはドライランなので、実際のAPI呼び出しは行われません"
+fi
+echo ""
+
 # 最終サマリー
 echo "=================================================="
 echo "✅ Stage1 CLI テスト完了"
@@ -287,6 +303,7 @@ echo "  - キャッシュファイル: $(ls .cache/posts_*.pkl 2>/dev/null | wc 
 echo "  - ログファイル: あり"
 echo "  - fetched_at: 記録済み"
 echo "  - レートリミット: 管理済み"
+echo "  - 多様性サンプリング: テスト済み"
 echo ""
 echo "🎯 次のステップ:"
 echo "  1. Streamlit アプリを起動:"
@@ -297,6 +314,7 @@ echo "     - test_accounts_mixed.txt をアップロード"
 echo "     - キャッシュ検出を確認"
 echo "     - 「🚀 不足分を取得」を実行"
 echo "     - 各ステータス表示を確認"
+echo "     - 多様性サンプリング機能をテスト"
 echo ""
 echo "詳細な手順は TEST_PROCEDURE.md を参照してください。"
 echo "=================================================="

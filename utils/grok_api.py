@@ -275,7 +275,7 @@ class GrokAPI:
                 logger.warning(f"[方法3] 失敗（リトライ不可または再試行後も失敗）: {error}")
                 break
 
-        logger.warning(f"❌ @{account}: すべての実データ取得方法が失敗したため、アカウントを除外します。")
+        logger.error(f"❌ @{account}: すべての実データ取得方法が失敗したため、アカウントを除外します。")
         log_structured_api_call(
             source="unknown",
             account=account,

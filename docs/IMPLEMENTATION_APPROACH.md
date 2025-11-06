@@ -6,8 +6,17 @@
 2. [全体アーキテクチャ](#2-全体アーキテクチャ)
 3. [ステップ1: 実データ優先の取得パイプライン](#3-ステップ1-実データ優先の取得パイプライン)
 4. [ステップ2: 多様性を担保したアカウント発見](#4-ステップ2-多様性を担保したアカウント発見)
+   - [4.1 設計思想](#41-設計思想)
+   - [4.2 ハイブリッドサンプリングアーキテクチャ](#42-ハイブリッドサンプリングアーキテクチャ)
+   - [4.3 多様性指標の計算](#43-多様性指標の計算)
+   - [4.4 サンプリング手法](#44-サンプリング手法)
+   - [4.5 CLI統合](#45-cli統合)
+   - [4.6 キーワード検索の詳細ロジック](#46-キーワード検索の詳細ロジック)
+   - [4.7 ランダム収集の詳細ロジック](#47-ランダム収集の詳細ロジック)
 5. [ステップ3: ペルソナ生成と日本語出力の強制](#5-ステップ3-ペルソナ生成と日本語出力の強制)
 6. [ステップ4: 品質管理とキャッシュハイジーン](#6-ステップ4-品質管理とキャッシュハイジーン)
+   - [6.1 キャッシュサニタイザー](#61-キャッシュサニタイザー)
+   - [6.2 品質スコアリング（quality_score）の詳細](#62-品質スコアリングquality_scoreの詳細)
 7. [ステップ5: ターン制議論システム](#7-ステップ5-ターン制議論システム)
 8. [ステップ6: マーケティング活用のための多様性指標](#8-ステップ6-マーケティング活用のための多様性指標)
 
@@ -362,6 +371,158 @@ python ingest_accounts.py --discover-random --max-results 50
 - ❌ 単なるWeb検索結果をそのまま返す（多様性を担保しない）
 - ⚠️ 品質フィルタリングは行われるが、多様性を担保するサンプリングは行われない
 
+### 4.6 キーワード検索の詳細ロジック
+
+キーワード検索は、Grok Web Searchを使用して指定されたキーワードに関連する影響力のあるアカウントを検索します。
+
+#### キーワード検索の実装箇所
+
+```python
+# utils/grok_api.py:818-975
+def discover_accounts_by_keyword(
+    self,
+    keyword: str,
+    max_results: int = 50,
+    dry_run: bool = False,
+    x_api_client=None
+) -> List[Dict]:
+```
+
+#### キーワード検索の処理フロー
+
+1. **プリセットキーワードのチェック**
+   - キーワードが`PRESET_KEYWORDS`に含まれている場合、実際のキーワードに変換
+   - 例: `tech_ai` → `"AI engineer, machine learning researcher"`
+
+2. **Grok Web Searchによる検索**
+   - Grok APIに以下のプロンプトを送信:
+     ```
+     X (Twitter) で「{keyword}」に関連する影響力のあるアカウントを最大{max_results}件検索してください。
+     
+     【重要な指示】
+     - 実際に存在するアクティブなアカウントのみを返してください
+     - フォロワー数が多い、またはその分野で認知されているアカウントを優先
+     - ボットやスパムアカウントは除外
+     - アカウント名（@handle）、表示名、簡単な説明を含める
+     
+     【品質基準】
+     - フォロワー数: 可能であれば1,000以上を優先
+     - アクティビティ: 最近30日以内に投稿があるアカウント
+     - 信頼度スコア: 以下の基準で設定してください
+       * 0.95-1.0: その分野で第一人者、大規模フォロワー（10万以上）、メディア露出あり
+       * 0.85-0.94: 影響力のあるアカウント、ある程度のフォロワー（1万以上）、継続的な投稿
+       * 0.70-0.84: アクティブな専門家、中小規模フォロワー、質の高い投稿
+       * 0.60-0.69: 関連はあるが影響力は限定的
+       * 0.60未満: 除外推奨
+     ```
+
+3. **JSONパースとデータ変換**
+   - Grok APIのレスポンスからJSON配列を抽出
+   - 各アカウント情報を以下の形式に変換:
+     ```python
+     {
+         "handle": handle,              # @なしのアカウント名
+         "display_name": display_name,  # 表示名
+         "confidence": float,            # 信頼度スコア (0.0-1.0)
+         "profile_url": f"https://x.com/{handle}",
+         "description": description,    # 説明文
+         "source": "grok_keyword"       # データソース
+     }
+     ```
+
+4. **品質フィルタリング**
+   - 信頼度スコアが0.7未満のアカウントを除外（`_filter_accounts_by_quality`）
+   - 信頼度の降順でソート
+
+5. **詳細品質評価**
+   - `check_account_quality`を実行して`quality_score`を付与
+   - 品質基準を満たさないアカウントを除外
+
+#### キーワード検索の出力形式
+
+```python
+[
+    {
+        "handle": "ai_engineer_001",
+        "display_name": "AI Engineer",
+        "confidence": 0.85,
+        "profile_url": "https://x.com/ai_engineer_001",
+        "description": "10年のAI/ML経験を持つエンジニア",
+        "source": "grok_keyword",
+        "quality_score": 0.82,
+        "quality_reasons": [
+            "フォロワー数: 5000 (正規化スコア: 0.72)",
+            "最終投稿: 5日前 (正規化スコア: 1.00)",
+            "ツイート数: 1200 (正規化スコア: 1.00)"
+        ]
+    },
+    ...
+]
+```
+
+### 4.7 ランダム収集の詳細ロジック
+
+ランダム収集は、複数のプリセットクエリをランダムに実行し、重複を除いたアカウントリストを返します。
+
+#### ランダム収集の実装箇所
+
+```python
+# utils/grok_api.py:976-1107
+def discover_accounts_random(
+    self,
+    max_results: int = 50,
+    dry_run: bool = False,
+    category: Optional[str] = None,
+    x_api_client=None
+) -> List[Dict]:
+```
+
+#### カテゴリ別プリセットクエリ
+
+システムは以下のカテゴリに分類されたプリセットクエリを持っています：
+
+- **tech**: 技術系アカウント（AI研究者、MLエンジニア、サイバーセキュリティ専門家等）
+- **business**: ビジネス系アカウント（スタートアップ創業者、VC、経営者等）
+- **creative**: クリエイティブ系アカウント（デザイナー、イラストレーター、写真家等）
+- **science**: 科学系アカウント（データサイエンティスト、研究者、物理学者等）
+- **developer**: 開発者系アカウント（ソフトウェアエンジニア、OSS貢献者等）
+- **product**: プロダクト系アカウント（プロダクトマネージャー、プロダクト戦略家等）
+- **community**: コミュニティ系アカウント（テックライター、ブロガー、ポッドキャスター等）
+
+#### ランダム収集の処理フロー
+
+1. **カテゴリ指定の処理**
+   - `category`が指定されている場合、該当カテゴリのクエリのみを使用
+   - 指定がない場合、全カテゴリのクエリを結合
+
+2. **クエリのシャッフル**
+   - プリセットクエリをランダムにシャッフル（`random.shuffle`）
+
+3. **各クエリで検索**
+   - 各クエリに対して`discover_accounts_by_keyword`を実行
+   - 一度に最大20件を取得（`max_results`に達するまで）
+
+4. **重複除外**
+   - `seen_handles`セットで重複を管理
+   - 既に追加されたアカウントはスキップ
+
+5. **ソースの上書き**
+   - すべてのアカウントの`source`を`"grok_random"`に設定
+
+#### ランダム収集の出力形式
+
+キーワード検索と同様の形式ですが、`source`が`"grok_random"`になります。
+
+#### 使用例
+
+```bash
+# 全カテゴリからランダムに50件収集
+python ingest_accounts.py --discover-random --max-results 50
+
+# techカテゴリのみから30件収集
+python ingest_accounts.py --discover-random --max-results 30 --category tech
+```
+
 ---
 
 ## 5. ステップ3: ペルソナ生成と日本語出力の強制
@@ -441,19 +602,207 @@ def has_generated_posts(posts: List[Dict]) -> bool:
 3. 新規取得完了時（457-464行目）
 4. バッチ集約時（1312-1319行目）
 
-### 6.2 品質スコアリング
+### 6.2 品質スコアリング（quality_score）の詳細
+
+`quality_score`は、アカウントの信頼性を定量化する指標（0.0-1.0）です。実世界の指標（フォロワー数、最終投稿日、ツイート数）から計算されます。
+
+#### quality_scoreの実装箇所
 
 ```python
-# utils/grok_api.py:1203-1348
-def check_account_quality(account, account_info, thresholds, x_api_client):
-    """
-    品質スコア計算:
-    quality_score = 0.5 * followers_norm + 0.3 * recency_norm + 0.2 * postcount_norm
-    """
+# utils/grok_api.py:1246-1437
+def check_account_quality(
+    self,
+    account: str,
+    account_info: Dict,
+    thresholds: Dict = None,
+    x_api_client=None
+) -> Dict:
 ```
 
-- 0.6未満は品質基準未満として除外推奨
-- X API無効時は暫定評価
+#### 基本計算式
+
+```python
+quality_score = 0.5 * followers_norm + 0.3 * recency_norm + 0.2 * postcount_norm
+```
+
+3つの指標を重み付きで合計します：
+
+- **フォロワー数スコア（`followers_norm`）**: 重み **0.5**
+- **最終投稿の新しさスコア（`recency_norm`）**: 重み **0.3**
+- **ツイート数スコア（`postcount_norm`）**: 重み **0.2**
+
+最終的なスコアは`max(0.0, min(1.0, score))`で0.0-1.0の範囲に制限されます。
+
+#### 各指標の正規化方法
+
+##### 1. フォロワー数スコア（`followers_norm`）
+
+```python
+# utils/grok_api.py:1315-1328
+if followers_count >= 10000:
+    followers_norm = 1.0
+elif followers_count >= 1000:
+    followers_norm = 0.5 + 0.5 * ((followers_count - 1000) / 9000)
+elif followers_count >= thresholds['min_followers']:  # 100
+    followers_norm = 0.3 * (followers_count / thresholds['min_followers'])
+else:
+    followers_norm = 0.1 * (followers_count / thresholds['min_followers'])
+```
+
+**スコア分布**:
+- **10,000以上**: 1.0（最大スコア）
+- **1,000〜10,000**: 0.5 + 0.5 × ((followers_count - 1000) / 9000)（線形補間）
+- **100〜1,000**: 0.3 × (followers_count / 100)（比例）
+- **100未満**: 0.1 × (followers_count / 100)（低スコア）
+
+**例**:
+- フォロワー数 50,000 → `followers_norm = 1.0`
+- フォロワー数 5,000 → `followers_norm = 0.5 + 0.5 × (4000/9000) = 0.72`
+- フォロワー数 500 → `followers_norm = 0.3 × (500/100) = 1.5` → `1.0`（上限）
+- フォロワー数 50 → `followers_norm = 0.1 × (50/100) = 0.05`
+
+##### 2. 最終投稿の新しさスコア（`recency_norm`）
+
+```python
+# utils/grok_api.py:1330-1352
+if days_inactive <= 30:
+    recency_norm = 1.0
+elif days_inactive <= 90:
+    recency_norm = 0.7
+elif days_inactive <= thresholds['max_days_inactive']:  # 180
+    recency_norm = 0.3
+else:
+    recency_norm = 0.0
+```
+
+**スコア分布**:
+- **30日以内**: 1.0（アクティブ）
+- **31〜90日**: 0.7（やや非アクティブ）
+- **91〜180日**: 0.3（非アクティブ）
+- **180日超**: 0.0（長期非アクティブ）
+
+**例**:
+- 最終投稿 5日前 → `recency_norm = 1.0`
+- 最終投稿 60日前 → `recency_norm = 0.7`
+- 最終投稿 120日前 → `recency_norm = 0.3`
+- 最終投稿 200日前 → `recency_norm = 0.0`
+
+##### 3. ツイート数スコア（`postcount_norm`）
+
+```python
+# utils/grok_api.py:1354-1365
+if tweet_count >= 1000:
+    postcount_norm = 1.0
+elif tweet_count >= thresholds['min_tweet_count']:  # 50
+    postcount_norm = 0.5 + 0.5 * ((tweet_count - thresholds['min_tweet_count']) / 950)
+else:
+    postcount_norm = 0.3 * (tweet_count / thresholds['min_tweet_count'])
+```
+
+**スコア分布**:
+- **1,000以上**: 1.0（最大スコア）
+- **50〜1,000**: 0.5 + 0.5 × ((tweet_count - 50) / 950)（線形補間）
+- **50未満**: 0.3 × (tweet_count / 50)（比例）
+
+**例**:
+- ツイート数 2,000 → `postcount_norm = 1.0`
+- ツイート数 500 → `postcount_norm = 0.5 + 0.5 × (450/950) = 0.74`
+- ツイート数 25 → `postcount_norm = 0.3 × (25/50) = 0.15`
+
+#### 品質基準（閾値）
+
+```python
+# utils/grok_api.py:82-87
+QUALITY_THRESHOLDS = {
+    'min_followers': 100,          # 最小フォロワー数
+    'min_tweet_count': 50,         # 最小ツイート数（投稿数）
+    'max_days_inactive': 180,      # 最大非アクティブ日数（最終ツイートから）
+    'min_quality_score': 0.6      # 最小品質スコア（0.0-1.0）
+}
+```
+
+**基準**:
+- **最小フォロワー数**: 100（これ未満は品質基準未満）
+- **最小ツイート数**: 50（これ未満は品質基準未満）
+- **最大非アクティブ日数**: 180日（これ超は品質基準未満）
+- **最小品質スコア**: 0.6（これ未満は除外推奨）
+
+#### 計算例
+
+##### 計算例1: 高品質アカウント
+- フォロワー数: 5,000 → `followers_norm = 0.72`
+- 最終投稿: 5日前 → `recency_norm = 1.0`
+- ツイート数: 1,200 → `postcount_norm = 1.0`
+- **quality_score = 0.5 × 0.72 + 0.3 × 1.0 + 0.2 × 1.0 = 0.86** ✅
+
+##### 計算例2: 中品質アカウント
+- フォロワー数: 800 → `followers_norm = 0.3 × (800/100) = 2.4` → `1.0`（上限）
+- 最終投稿: 60日前 → `recency_norm = 0.7`
+- ツイート数: 200 → `postcount_norm = 0.5 + 0.5 × (150/950) = 0.58`
+- **quality_score = 0.5 × 1.0 + 0.3 × 0.7 + 0.2 × 0.58 = 0.86** ✅
+
+##### 計算例3: 低品質アカウント
+- フォロワー数: 50 → `followers_norm = 0.1 × (50/100) = 0.05`
+- 最終投稿: 200日前 → `recency_norm = 0.0`
+- ツイート数: 20 → `postcount_norm = 0.3 × (20/50) = 0.12`
+- **quality_score = 0.5 × 0.05 + 0.3 × 0.0 + 0.2 × 0.12 = 0.05** ❌（0.6未満）
+
+#### X APIが無効な場合のフォールバック評価
+
+X APIメトリクスが取得できない場合、信頼度ベースの暫定評価を行います：
+
+```python
+# utils/grok_api.py:1394-1412
+else:
+    # メトリクスが取得できない場合、フォールバック評価
+    confidence = account_info.get('confidence', 0.0)
+    description = account_info.get('description', '')
+    
+    if confidence < 0.7:
+        passed = False
+        score = confidence * 0.8  # 信頼度ベースの暫定スコア
+    else:
+        score = 0.5 + (confidence - 0.5) * 0.5
+    
+    if not description or len(description.strip()) < 20:
+        score *= 0.9
+        reasons.append("説明文が不十分")
+    
+    reasons.append(f"メトリクス未取得（信頼度ベース評価: {confidence:.2f}）")
+    if x_api_client is None:
+        reasons.append("X API metrics unavailable – fallback evaluation")
+```
+
+**暫定評価の計算**:
+- **信頼度（`confidence`）が0.7未満**: `score = confidence × 0.8`
+- **信頼度が0.7以上**: `score = 0.5 + (confidence - 0.5) × 0.5`
+- **説明文が20文字未満**: スコアに0.9を乗算
+
+**例**:
+- 信頼度 0.9、説明文あり → `score = 0.5 + (0.9 - 0.5) × 0.5 = 0.7`
+- 信頼度 0.6、説明文あり → `score = 0.6 × 0.8 = 0.48`
+- 信頼度 0.9、説明文なし → `score = 0.7 × 0.9 = 0.63`
+
+この暫定評価時は`quality_reasons`に「X API metrics unavailable – fallback evaluation」が追加されます。
+
+#### 品質評価の結果
+
+`check_account_quality`は以下の形式で結果を返します：
+
+```python
+{
+    'passed': bool,           # 品質基準を満たしているか
+    'score': float,           # 品質スコア (0.0-1.0)
+    'reasons': List[str],     # 評価理由
+    'recommendation': str     # 推奨アクション
+}
+```
+
+**`passed`が`False`になる条件**:
+1. フォロワー数が100未満
+2. ツイート数が50未満
+3. 最終投稿から180日以上経過
+4. `quality_score`が0.6未満
 
 ---
 

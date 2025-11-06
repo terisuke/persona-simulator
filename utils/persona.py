@@ -4,10 +4,22 @@
 """
 
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, TypedDict
 from textblob import TextBlob
 
 logger = logging.getLogger(__name__)
+
+
+class PersonaProfile(TypedDict, total=False):
+    """ペルソナプロファイルの型定義"""
+    name: str
+    background: str
+    personality: str
+    tone: str
+    tendencies: List[str]
+    confidence: float
+    quality_score: float
+    quality_reasons: List[str]
 
 
 class PersonaManager:
