@@ -323,6 +323,21 @@ class TestDiversitySampling(unittest.TestCase):
         account_empty = {"description": ""}
         self.assertEqual(self.sampler._analyze_sentiment(account_empty), "neutral")
 
+    def test_has_generated_posts(self):
+        """生成データ検出のテスト"""
+        # app.pyからインポート
+        from app import has_generated_posts
+        
+        # サンプルデータ
+        self.assertTrue(has_generated_posts([{"id": "sample_123"}]))
+        self.assertTrue(has_generated_posts([{"id": "generated_123"}]))
+        self.assertFalse(has_generated_posts([{"id": "web_search_123"}]))
+        self.assertFalse(has_generated_posts([{"id": "twitter_123"}]))
+        self.assertFalse(has_generated_posts([]))
+        
+        # 空のID
+        self.assertFalse(has_generated_posts([{"id": ""}]))
+
 
 if __name__ == "__main__":
     unittest.main()

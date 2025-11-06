@@ -9,7 +9,7 @@ import time
 import re
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, ClassVar, Tuple
 
 from textblob import TextBlob
 
@@ -29,7 +29,7 @@ class DiversitySampler:
     注意: 「ハイブリッド」はデータソースの組み合わせを指し、サンプリング手法の組み合わせではありません。
     """
 
-    FOLLOWER_STRATA = [
+    FOLLOWER_STRATA: ClassVar[List[Tuple[int, int, str]]] = [
         (0, 100, "micro"),
         (100, 1000, "small"),
         (1000, 10000, "medium"),
@@ -38,7 +38,7 @@ class DiversitySampler:
         (1000000, float("inf"), "mega"),
     ]
 
-    REGIONS = {
+    REGIONS: ClassVar[Dict[str, str]] = {
         "JP": "日本",
         "US": "アメリカ",
         "GB": "イギリス",
@@ -51,10 +51,10 @@ class DiversitySampler:
         "CA": "カナダ",
     }
 
-    LANGUAGES = ["ja", "en", "ko", "zh", "es", "fr", "de", "pt"]
+    LANGUAGES: ClassVar[List[str]] = ["ja", "en", "ko", "zh", "es", "fr", "de", "pt"]
 
     # クォータ比率のデフォルト値
-    DEFAULT_FOLLOWER_QUOTAS = {
+    DEFAULT_FOLLOWER_QUOTAS: ClassVar[Dict[str, float]] = {
         "micro": 1/6,
         "small": 1/6,
         "medium": 1/3,
@@ -63,18 +63,22 @@ class DiversitySampler:
         "mega": 1/12,
     }
 
-    DEFAULT_REGION_QUOTAS = {
+    DEFAULT_REGION_QUOTAS: ClassVar[Dict[str, float]] = {
         "JP": 1/2,
         "US": 1/4,
         "GB": 1/8,
         "KR": 1/8,
     }
 
-    DEFAULT_SENTIMENT_QUOTAS = {
+    DEFAULT_SENTIMENT_QUOTAS: ClassVar[Dict[str, float]] = {
         "positive": 1/3,
         "neutral": 1/3,
         "negative": 1/3,
     }
+
+    # 検索バッチサイズの定数
+    DEFAULT_SEARCH_BATCH_SIZE: ClassVar[int] = 20
+    MIN_FALLBACK_RESULTS: ClassVar[int] = 5
 
     def __init__(self, x_api_client=None, grok_api=None):
         """
@@ -136,7 +140,7 @@ class DiversitySampler:
 
             if prefer_x_api and self.x_api_client and self._can_use_x_api():
                 try:
-                    account_batch = self._discover_via_x_api(query, max_results=20)
+                    account_batch = self._discover_via_x_api(query, max_results=self.DEFAULT_SEARCH_BATCH_SIZE)
                     if account_batch:
                         x_api_success_count += 1
                         logger.info(f"✅ X API成功: '{query}' → {len(account_batch)}件")
@@ -150,9 +154,9 @@ class DiversitySampler:
                     logger.error(f"予期しないエラー: '{query}' - {error}", exc_info=True)
                     raise
 
-            if (not account_batch or len(account_batch) < 5) and fallback_to_grok and self.grok_api:
+            if (not account_batch or len(account_batch) < self.MIN_FALLBACK_RESULTS) and fallback_to_grok and self.grok_api:
                 try:
-                    grok_batch = self._discover_via_grok(query, max_results=20)
+                    grok_batch = self._discover_via_grok(query, max_results=self.DEFAULT_SEARCH_BATCH_SIZE)
                     if grok_batch:
                         grok_success_count += 1
                         existing_handles = {acc.get("handle", "").lstrip("@") for acc in account_batch}
@@ -216,8 +220,10 @@ class DiversitySampler:
         logger.info(f"✅ ハイブリッドサンプリング完了: {len(sampled)}件")
         return sampled
 
-    def _discover_via_x_api(self, query: str, max_results: int = 20) -> List[Dict]:
+    def _discover_via_x_api(self, query: str, max_results: int = None) -> List[Dict]:
         """X API v2でアカウントを検索。"""
+        if max_results is None:
+            max_results = self.DEFAULT_SEARCH_BATCH_SIZE
         if not self.x_api_client:
             return []
 
@@ -267,8 +273,10 @@ class DiversitySampler:
 
         return accounts[:max_results]
 
-    def _discover_via_grok(self, query: str, max_results: int = 20) -> List[Dict]:
+    def _discover_via_grok(self, query: str, max_results: int = None) -> List[Dict]:
         """Grok Web Searchでアカウントを検索。"""
+        if max_results is None:
+            max_results = self.DEFAULT_SEARCH_BATCH_SIZE
         if not self.grok_api:
             return []
 

@@ -924,6 +924,20 @@ def main():
                     sampling_method = params.get('sampling_method', 'stratified')
                     prefer_x_api_flag = params.get('prefer_x_api', True)
                     fallback_flag = params.get('fallback_to_grok', True)
+                    
+                    # 入力検証
+                    ALLOWED_SAMPLING_METHODS = {"stratified", "quota", "random"}
+                    if sampling_method not in ALLOWED_SAMPLING_METHODS:
+                        st.error(f"無効なサンプリング手法: {sampling_method}")
+                        st.session_state['discovery_in_progress'] = False
+                        st.rerun()
+                    
+                    # max_resultsの検証
+                    if not isinstance(max_results, int) or max_results <= 0:
+                        st.error(f"無効な最大結果数: {max_results}")
+                        st.session_state['discovery_in_progress'] = False
+                        st.rerun()
+                    
                     cmd = [
                         "python", "ingest_accounts.py", "--diversity-sampling",
                         "--max-results", str(max_results)
@@ -1888,6 +1902,8 @@ def main():
                         source_display = '🔍 Keyword'
                     elif source_cat == 'Random':
                         source_display = '🎲 Random'
+                    elif source_cat == 'Diversity':
+                        source_display = '🧮 Diversity'
                     else:
                         source_display = '❓ Unknown'
                     
